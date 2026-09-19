@@ -1,696 +1,779 @@
 # PLAN.md - Docker-Sandbox mit erzwungenem SOCKS5-Egress
 
-Stand: 2026-09-18
+Stand: 2026-09-19 (Revision 2)
 Status: Entwurf zur Abstimmung - **noch keine Implementierung**
+
+Revision 2 setzt drei Festlegungen um:
+
+1. Der SSH-Tunnel laeuft **auf dem Host**, unabhaengig vom Container-Lebenszyklus.
+   Kein Tunnel bedeutet kein Netz im Container.
+2. DNS wird **ueber TCP** gefuehrt (Begruendung und Normbezug in Abschnitt 4).
+3. Die Anwendung ist CPU-durchsatzkritisch und soll **als root** laufen.
+   Das Design stellt das sicher, ohne die Schutzwirkung aufzugeben
+   (Abschnitt 6).
 
 ---
 
 ## 1. Ziel
 
-Ein reproduzierbar gebauter Docker-Container auf Basis von Ubuntu 26.04
-("Resolute Raccoon"), in dem eine beliebige Anwendung laeuft, deren gesamter
-Netzwerkverkehr zwingend durch einen SOCKS5-Proxy geht, der von einem
-SSH-Tunnel (`ssh -D`) zu einem externen Host bereitgestellt wird.
+Ein reproduzierbar gebauter Container auf Basis von Ubuntu 26.04
+("Resolute Raccoon"), in dem eine beliebige, rechenintensive Anwendung als root
+laeuft und deren gesamter Netzwerkverkehr zwingend durch einen SOCKS5-Proxy
+geht, der von einem SSH-Tunnel auf dem Host bereitgestellt wird.
 
 Harte Anforderungen:
 
 1. **Transparenz** - die Anwendung braucht keine Proxy-Konfiguration.
-2. **Fail-closed** - faellt der Tunnel aus, gibt es *keinen* Netzverkehr,
-   insbesondere keinen direkten Fallback.
-3. **Default-Deny** - alles ausser dem Proxy-Pfad ist geblockt, und zwar
-   sowohl im Container als auch auf dem Host.
-4. **Fallback fuer Sonderfaelle** - Anwendungen, die einen Proxy explizit
-   ansprechen wollen, finden ihn zusaetzlich unter einer festen Adresse
-   (`127.0.0.1:1080`, plus `ALL_PROXY`/`HTTPS_PROXY` in der Umgebung).
+2. **Fail-closed** - kein Tunnel, kein Netz. Kein direkter Fallback.
+3. **Default-Deny** - alles ausser dem Proxy-Pfad ist geblockt.
+4. **Kein Performance-Eingriff** - die Sandbox darf den CPU-Durchsatz der
+   Anwendung nicht messbar beeinflussen.
+5. **Fallback** - Anwendungen, die einen Proxy explizit ansprechen wollen,
+   finden ihn unter einer festen Adresse.
 
-Ausserhalb des Zielbilds (vorerst): GUI-Anwendungen (X11/Wayland-Sockets),
-eingehende Verbindungen in den Container, Windows-/macOS-Hosts (Docker Desktop
-hat keinen direkt kontrollierbaren `DOCKER-USER`-Pfad).
+Ausserhalb des Zielbilds: GUI-Anwendungen, eingehende Verbindungen in den
+Container, Docker Desktop unter Windows/macOS (dort gibt es keinen direkt
+kontrollierbaren `DOCKER-USER`-Pfad).
 
 ---
 
-## 2. Das zentrale technische Problem
+## 2. Das bestimmende technische Problem
 
 `ssh -D` implementiert einen SOCKS-Server, der **nur TCP** transportiert. Der
 SOCKS5-Befehl `UDP ASSOCIATE` wird von OpenSSH nicht unterstuetzt. Daraus
-folgen drei Konsequenzen, die das gesamte Design bestimmen:
+folgt:
 
 | Konsequenz | Bedeutung |
 |---|---|
 | Kein UDP durch den Tunnel | QUIC (HTTP/3), NTP, WireGuard, klassisches DNS-over-UDP funktionieren nicht. |
-| Kein ICMP | `ping` und `traceroute` aus dem Container heraus schlagen fehl. Das ist gewollt, muss aber dokumentiert sein. |
-| DNS braucht eine Sonderloesung | Ohne funktionierendes DNS ist der Container faktisch unbrauchbar. Siehe Abschnitt 4.3. |
+| Kein ICMP | `ping` und `traceroute` aus dem Container schlagen fehl. Gewollt, aber dokumentationspflichtig. |
+| DNS braucht eine Sonderloesung | Siehe Abschnitt 4. |
 
-Genau deshalb faellt die Wahl auf **iptables-REDIRECT + redsocks** und nicht
-auf einen TUN-basierten Ansatz: ein TUN-Device wuerde auch UDP-Pakete
-annehmen, die dann im Tunnel verloren gehen - die Anwendung bekaeme
-Timeouts statt sauberer Fehler. Mit REDIRECT wird ausschliesslich TCP
-umgelenkt; jedes andere Protokoll wird von der Firewall **hart verworfen**,
-was zu klaren, schnellen Fehlern fuehrt.
+Deshalb wird **iptables-REDIRECT + redsocks** verwendet und kein TUN-Ansatz:
+ein TUN-Device nimmt auch UDP-Pakete an, die im Tunnel verloren gehen - die
+Anwendung bekaeme Timeouts statt sauberer Fehler. Mit REDIRECT wird
+ausschliesslich TCP umgelenkt; alles andere wird hart verworfen und
+schlaegt sofort und eindeutig fehl.
 
 ---
 
-## 3. Architektur
+## 3. Warum nicht einfach proxychains
 
-### 3.1 Datenfluss
+Zur Vollstaendigkeit, weil es die naheliegendste Idee ist: `proxychains-ng`
+haengt sich per `LD_PRELOAD` in `connect()` der libc. Das greift nicht bei
+statisch gelinkten Programmen, nicht bei Sprachen mit eigener Syscall-Schicht
+(Go), nicht bei `setuid`-Binaries und nicht bei Kindprozessen, die die
+Umgebungsvariable verlieren. Es ist eine Konvention, keine Durchsetzung - und
+damit fuer eine Sandbox ungeeignet.
 
-```
-+---------------------------------------------------------------+
-|  Container "sandbox"   (eigener Network-Namespace)            |
-|                                                               |
-|   [Anwendung, UID 10001]                                      |
-|        |  connect() -> 93.184.216.34:443                      |
-|        v                                                      |
-|   nat/OUTPUT -> Kette SANDBOX_REDIR                           |
-|        |  (UID 10002 ausgenommen, Loopback ausgenommen)       |
-|        |  REDIRECT --to-ports 12345                           |
-|        v                                                      |
-|   [redsocks, UID 10002]  127.0.0.1:12345                      |
-|        |  Originalziel via SO_ORIGINAL_DST rekonstruiert      |
-|        |  SOCKS5 CONNECT                                      |
-|        v                                                      |
-|   [ssh -D 1080, UID 10002]  127.0.0.1:1080                    |
-|        |                                                      |
-|        |  einzige von filter/OUTPUT erlaubte Verbindung       |
-+--------|------------------------------------------------------+
-         |  TCP ${SSH_PORT} -> ${SSH_HOST}
-         v
-   Bridge br-xxxxxxxx (Host)
-         |
-   FORWARD -> DOCKER-USER -> Kette SANDBOX_EGRESS
-         |    (alles ausser ${SSH_HOST}:${SSH_PORT} wird verworfen)
-         v
-   [externer SSH-Server] ---> Internet
-```
+---
 
-Zwei voneinander unabhaengige Verteidigungslinien:
+## 4. DNS ueber TCP - ja, das gibt es, und ja, es ist die Loesung
 
-* **Linie 1 (Container):** `filter/OUTPUT` mit Policy `DROP`. Nur Loopback und
-  die eine TCP-Verbindung des Tunnel-UID nach `${SSH_HOST}:${SSH_PORT}` sind
-  erlaubt. Selbst wenn redsocks abstuerzt, kann kein Paket direkt hinaus.
-* **Linie 2 (Host):** `DOCKER-USER` verwirft alles, was aus dem Sandbox-Subnetz
-  kommt und nicht an den SSH-Endpunkt geht. Diese Linie haelt auch dann, wenn
-  jemand im Container die Container-Firewall abschaltet.
+**Kurzantwort: DNS over TCP ist kein Workaround, sondern Standard und seit
+2016 verpflichtend.**
 
-### 3.2 Entscheidung: Wo laeuft der SSH-Client?
+* DNS ueber TCP ist seit RFC 1035 (1987), Abschnitt 4.2.2, Teil der
+  Spezifikation - urspruenglich vor allem fuer Zonentransfers und fuer
+  Antworten, die nicht in ein UDP-Paket passen.
+* **RFC 7766** (2016, "DNS Transport over TCP - Implementation Requirements")
+  hebt das auf Pflichtniveau: alle allgemeinen DNS-Implementierungen MUESSEN
+  sowohl UDP als auch TCP unterstuetzen; rekursive Server und Forwarder
+  MUESSEN TCP unterstuetzen. Entscheidend fuer uns ist die Aussage zur
+  Transportwahl: Stub- und rekursive Resolver DUERFEN wahlweise TCP oder UDP
+  senden, und **TCP darf verwendet werden, ohne vorher UDP zu versuchen**.
+  Was wir hier bauen, ist also ausdruecklich standardkonformes Verhalten und
+  kein Trick.
+* **RFC 9210** (2022, BCP 235, "DNS Transport over TCP - Operational
+  Requirements") zieht die Betriebsseite nach: DNS ueber TCP zuzulassen ist
+  Best Current Practice; RFC 1123 wird dahingehend aktualisiert, dass alle
+  Resolver und rekursiven Server TCP- und UDP-Anfragen bedienen MUESSEN, und
+  RFC 1536 wird um die Fehlvorstellung bereinigt, TCP sei nur fuer
+  Zonentransfers da.
+* Alle grossen oeffentlichen Resolver (Quad9, Cloudflare, Google) bedienen
+  TCP/53.
 
-| | Variante A: im Container (**Empfehlung**) | Variante B: auf dem Host |
-|---|---|---|
-| Tunnel-Prozess | `autossh`/`ssh -D` im Container | `ssh -D 0.0.0.0:1080` auf dem Host |
-| Container erreicht | nur `${SSH_HOST}:${SSH_PORT}` | nur Bridge-Gateway:1080 |
-| Docker-Netz | normale Bridge | kann `internal: true` sein |
-| Portabilitaet | Container ist autark, `run.sh` genuegt | Host-Setup noetig (Tunnel + systemd-Unit) |
-| Angriffsflaeche | SSH-Key liegt im Container-Kontext | Key bleibt auf dem Host |
-| Host-Regeln | nur `DOCKER-USER` (FORWARD) | zusaetzlich `INPUT` (siehe 5.3) |
+**Nachteile, ehrlich benannt:** Jede Anfrage kostet einen TCP-Handshake, und
+ueber einen SSH-Tunnel kommt dessen Latenz noch dazu. Ohne Gegenmassnahme
+merkt man das bei vielen unterschiedlichen Namen deutlich. Deshalb:
 
-**Empfehlung: Variante A**, weil damit der gesamte Mechanismus im Repo
-abbildbar ist und `run.sh` ohne vorbereiteten Host-Dienst funktioniert. Der
-Key-Nachteil laesst sich entschaerfen, indem statt einer Key-Datei der
-SSH-Agent-Socket eingebunden wird (`SSH_AUTH_SOCK`), sodass nie ein privater
-Schluessel im Container liegt.
+* Ein **cachender** Resolver (unbound) im Pfad - wiederholte Lookups kosten
+  dann gar keinen Netzverkehr mehr. Das ist bei einem tunnelbedingt langsamen
+  Pfad kein Luxus, sondern der eigentliche Hebel.
+* RFC 7766 empfiehlt ausdruecklich das Wiederverwenden offener
+  TCP-Verbindungen; unbound tut das.
 
-Variante B bleibt ueber `.env` (`PROXY_MODE=external`) waehlbar: dann entfaellt
-der SSH-Teil im Container und redsocks zeigt auf `${PROXY_HOST}:${PROXY_PORT}`.
-Das ist auch der Weg, wenn der SOCKS5-Proxy gar nicht von SSH stammt.
+**Umsetzung:** unbound mit `tcp-upstream: yes` (die Option existiert laut
+NLnet-Labs-Dokumentation genau fuer Tunnel-Szenarien) und
+`forward-zone: name: "."` auf einen konfigurierbaren Upstream. Der so
+erzeugte TCP-Strom wird vom REDIRECT eingefangen und laeuft damit automatisch
+durch den Tunnel.
 
-### 3.3 Entscheidung: Transparenz-Layer
+**Fallback, falls unbound ausfaellt oder unerwuenscht ist:** redsocks bringt
+`dnstc` mit - einen Fake-DNS-Server, der jede UDP-Anfrage mit gesetztem
+TC-Bit beantwortet. Die glibc wiederholt die Anfrage daraufhin ueber TCP
+(dieses Verhalten ist der Default; nur die Resolver-Option `RES_IGNTC`
+schaltet es ab). Kein Cache, aber ein Prozess weniger. Als
+`DNS_MODE=unbound|dnstc|host` in `.env` waehlbar.
 
-| Ansatz | Bewertung |
-|---|---|
-| **redsocks + iptables REDIRECT** | Gewaehlt. Vollstaendig transparent fuer TCP, unabhaengig von libc und Programmiersprache, kein TUN-Device noetig, in Ubuntu 26.04 als Paket verfuegbar (`redsocks`, universe). |
-| `proxychains-ng` (LD_PRELOAD) | Verworfen. Greift nur bei dynamisch gelinkten Programmen, die `connect()` der libc nutzen - statische Go-Binaries und alles mit direkten Syscalls entkommen. Keine Durchsetzung, nur Konvention. |
-| `tun2socks` (TUN-Device) | Verworfen als Default. Faengt auch UDP ab, das der SSH-Tunnel nicht transportieren kann - Ergebnis waeren Timeouts statt Fehlern. Braucht `/dev/net/tun`. Als Option sinnvoll, falls spaeter ein UDP-faehiger SOCKS5-Server (z. B. Dante) statt `ssh -D` genutzt wird. |
-| `sshuttle` | Verworfen. Loest dasselbe Problem elegant, aber ohne SOCKS5 - widerspricht der Anforderung und bringt eine eigene, weniger kontrollierbare Firewall-Logik mit. |
+`DNS_MODE=host` leitet die Aufloesung stattdessen an den Resolver des Hosts -
+schnell, aber dann sieht der lokale Resolver bzw. der Provider, welche Namen
+die Sandbox aufloest. Das ist ein bewusster Bruch des Bedrohungsmodells und
+darf nicht der Default sein.
 
-### 3.4 DNS - der kritische Punkt
+---
 
-Drei Teilprobleme greifen ineinander:
+## 5. Architektur
 
-1. **UDP geht nicht durch den Tunnel** (siehe Abschnitt 2).
-2. **Docker setzt bei benutzerdefinierten Netzen einen eigenen Resolver**
-   auf `127.0.0.11` in den Container-Namespace, der externe Anfragen an die
-   Resolver des Hosts weiterreicht. Diese Anfragen wuerden am Proxy
-   vorbeilaufen und sind damit ein echter Leak-Pfad - unsere `OUTPUT`-Policy
-   `DROP` blockt sie, aber dann gibt es ohne Ersatz gar kein DNS mehr.
-3. Ohne DNS-Aufloesung im Container ist fast jede Anwendung unbrauchbar.
+### 5.1 Grundentscheidung: Gateway-Sidecar
 
-**Loesung:** ein lokaler Resolver im Container, der ausschliesslich ueber TCP
-nach oben spricht - dieser TCP-Strom wird vom REDIRECT eingefangen und laeuft
-damit automatisch durch den Tunnel.
+Da der Tunnel auf dem Host liegt, waere es naheliegend, auch redsocks und
+unbound dort zu betreiben und den Container voellig unveraendert zu lassen
+(Variante "alles auf dem Host", Abschnitt 5.5). Dagegen spricht ein
+praktischer Punkt: `redsocks` ist in Ubuntu paketiert, in RHEL/Rocky aber
+nicht ohne Weiteres verfuegbar. Ein Setup, das auf deinen Ubuntu-Arbeitsplaetzen
+und auf Rocky-Hosts gleich funktionieren soll, sollte die Proxy-Schicht
+deshalb **im Container** mitbringen, nicht auf dem Host voraussetzen.
 
-* Primaerwahl: **unbound** mit `tcp-upstream: yes` (die Option existiert laut
-  NLnet-Labs-Dokumentation genau fuer Tunnel-Szenarien) und einer
-  `forward-zone: name: "."` auf einen konfigurierbaren Upstream. Unbound ist in
-  Ubuntu 26.04 in `main`, cached, und ist weniger fragil als die Alternativen.
-* Anbindung: In `docker-compose.yml` wird `dns: [127.0.0.1]` gesetzt. Laut
-  Docker-Dokumentation bezieht sich `--dns=127.0.0.1` ausdruecklich auf die
-  Loopback-Adresse *des Containers*; der eingebettete Resolver leitet dann an
-  unseren lokalen unbound weiter statt an die Host-Resolver.
-* Alternativen, falls unbound Probleme macht:
-  * `dnstc` aus redsocks - ein Fake-DNS-Server, der jede UDP-Anfrage mit
-    gesetztem TC-Bit beantwortet und den Resolver so zum TCP-Retry zwingt.
-    Funktioniert mit glibc zuverlaessig, ist aber vom Verhalten des Clients
-    abhaengig.
-  * `dnsu2t` aus redsocks - multiplext UDP-Anfragen in einen TCP-Strom zum
-    Upstream. Konzeptionell ideal, im Projekt aber als experimentell markiert.
-
-Im Bauplan wird unbound als Default gesetzt; `dnstc` wird als Schalter in
-`.env` (`DNS_MODE=unbound|dnstc`) vorgesehen.
-
-### 3.5 IPv6
-
-IPv6 ist ein klassischer Bypass: `ssh -D` liefert zwar IPv6-Ziele im Tunnel,
-aber jede Luecke in den v4-Regeln waere ueber v6 offen. Daher:
-
-* `sysctls: net.ipv6.conf.all.disable_ipv6=1` im Compose-File,
-* zusaetzlich `ip6tables` mit Policy `DROP` in allen drei Ketten,
-* im Host-Regelwerk optional eine `ip6tables`-Entsprechung.
-
-### 3.6 Ausbaustufe 2: Sidecar-Variante (Empfehlung fuer spaeter)
-
-Die Ein-Container-Loesung hat eine strukturelle Schwaeche: der Container
-braucht `CAP_NET_ADMIN`, um seine eigene Firewall zu setzen. Laeuft die
-Anwendung als root, kann sie diese Firewall wieder abraeumen. Deshalb gilt
-verbindlich: **die Anwendung laeuft unprivilegiert** (`APP_UID`, plus
-`no-new-privileges`).
-
-Wenn die Anwendung zwingend root braucht, ist die saubere Loesung eine
-Aufteilung in zwei Container, die sich einen Network-Namespace teilen:
+Empfehlung daher: **zwei Container, ein gemeinsamer Network-Namespace.**
 
 ```yaml
 services:
-  gateway:            # ssh -D, redsocks, unbound, Firewall, CAP_NET_ADMIN
+  gateway:            # redsocks + unbound + Regeln, CAP_NET_ADMIN
   app:
-    network_mode: "service:gateway"    # kein eigener Netz-Stack, keine Caps
-    depends_on:
-      gateway:
-        condition: service_healthy
+    network_mode: "service:gateway"   # teilt den Netz-Stack des Gateways
+    cap_drop: [ALL]                   # root ja, Capabilities nein
 ```
 
-`network_mode: "service:{name}"` ist Teil der Compose-Spezifikation. Die
-App bekommt dann `cap_drop: [ALL]` und kann die Regeln prinzipiell nicht
-anfassen. Das ist dieselbe Struktur, die VPN-Sidecars verwenden. Ich schlage
-vor, damit **nicht** zu starten, sondern es als Stufe 2 umzusetzen, sobald
-Stufe 1 nachweislich dicht ist.
+`network_mode: "service:{name}"` ist Teil der Compose-Spezifikation
+("Gives the service container access to the specified service only").
+
+Das loest die Root-Frage sauber: Die Anwendung laeuft als root, aber ohne
+`CAP_NET_ADMIN` - und ohne diese Capability kann auch root im Container keine
+iptables-Regel anfassen. Die Regeln liegen im gemeinsamen Namespace, gesetzt
+vom Gateway-Container, den die Anwendung nicht betreten kann.
+
+### 5.2 Datenfluss
+
+```
++-----------------------------+   +----------------------------------------+
+|  Container "app"            |   |  Container "gateway"                   |
+|  root, cap_drop: ALL        |   |  CAP_NET_ADMIN, unprivilegierte Dienste|
+|                             |   |                                        |
+|   [Anwendung]               |   |   [unbound]  127.0.0.1:53              |
+|        |                    |   |      tcp-upstream: yes                 |
+|        |                    |   |   [redsocks] 127.0.0.1:12345           |
++--------|--------------------+   +----------------------------------------+
+         |                                        |
+         +---------------+------------------------+
+                         |   gemeinsamer Network-Namespace
+                         v
+        nat/OUTPUT -> SANDBOX_REDIR
+          - UID von redsocks: RETURN (keine Schleife)
+          - 127.0.0.0/8, eigenes Subnetz: RETURN
+          - sonst TCP: REDIRECT --to-ports 12345
+                         |
+                         v
+        [redsocks] liest Originalziel via SO_ORIGINAL_DST
+                         |  SOCKS5 CONNECT
+                         v
+        filter/OUTPUT (Policy DROP)
+          - einzige Ausnahme: UID redsocks -> ${GW_IP}:${SOCKS_PORT}
+                         |
+                         v
+        Bridge br-sandbox  ---- Host: filter/INPUT -> SANDBOX_IN
+                         |        nur Port ${SOCKS_PORT} erlaubt
+                         v
+        [ssh -D auf dem Host]  ----> externer SSH-Server ----> Internet
+
+        Alles andere aus br-sandbox:
+        FORWARD -> DOCKER-USER -> SANDBOX_EGRESS -> DROP
+```
+
+### 5.3 Drei Verteidigungslinien
+
+| Linie | Ort | Wirkung |
+|---|---|---|
+| 1 | `filter/OUTPUT` im gemeinsamen Namespace, Policy `DROP` | Nur redsocks darf zum SOCKS-Port. Faellt redsocks aus, gibt es keinen Weg hinaus. |
+| 2 | `filter/INPUT` auf dem Host, Kette `SANDBOX_IN` | Die Sandbox erreicht vom Host nur den SOCKS-Port - keine anderen Host-Dienste. |
+| 3 | `DOCKER-USER` auf dem Host, Kette `SANDBOX_EGRESS` | Nichts aus dem Sandbox-Netz wird weitergeleitet. Haelt auch dann, wenn Linie 1 fehlt. |
+
+**Wichtiges Detail zu Linie 2 und 3:** Beide Ketten matchen auf das
+**Bridge-Interface** (`-i br-sandbox`), nicht nur auf das Quell-Subnetz. Ein
+Prozess im Container koennte sich sonst - mit `CAP_NET_ADMIN`, das wir zwar
+nicht vergeben, aber wir bauen hier eine Sandbox - eine IP ausserhalb des
+Subnetzes geben und am `-s`-Match vorbeirutschen. Das Interface laesst sich von
+innen nicht faelschen. Damit der Interface-Name stabil bleibt, wird er per
+`com.docker.network.bridge.name` fest vergeben; ohne diese Option heisst die
+Bridge `br-<hash>` und aendert sich beim Neuanlegen des Netzes.
+
+Zusaetzlich wird `com.docker.network.bridge.enable_ip_masquerade: false`
+gesetzt. Ohne Masquerading bekommen Pakete aus dem Sandbox-Netz gar kein SNAT
+mehr - selbst ein Loch in den Filterregeln fuehrt dann nicht ins Internet.
+
+**Wichtiges Detail zu Linie 2:** `DOCKER-USER` deckt nur **weitergeleiteten**
+Verkehr ab. Pakete vom Container an den Host selbst (die Bridge-Gateway-IP)
+laufen ueber `INPUT`, nicht ueber `FORWARD`. Ohne die `SANDBOX_IN`-Kette
+erreicht die Sandbox jeden Dienst, der auf dem Host lauscht. Dieser Punkt
+fehlt in den meisten Anleitungen im Netz.
+
+### 5.4 Der SSH-Tunnel auf dem Host
+
+* Eigene systemd-Unit (`host/sandbox-tunnel.service`), `Restart=always`,
+  `RestartSec=5`, dazu `-N -o ExitOnForwardFailure=yes
+  -o ServerAliveInterval=15 -o ServerAliveCountMax=3
+  -o StrictHostKeyChecking=yes`.
+  `ExitOnForwardFailure=yes` ist hier wesentlich: ohne diese Option laeuft
+  `ssh` weiter, obwohl der lokale Listener nicht zustande kam - der Tunnel
+  waere dann scheinbar da und tatsaechlich tot.
+* `StrictHostKeyChecking=yes` mit gepflegter `known_hosts`: ein SOCKS-Tunnel zu
+  einem nicht verifizierten Host waere eine Einladung zum MITM und wuerde die
+  gesamte Schutzwirkung aufheben.
+* **Offener Punkt Binding:** Damit der Container den Tunnel erreicht, muss
+  `ssh -D` auf einer fuer die Bridge erreichbaren Adresse lauschen. Drei
+  Moeglichkeiten:
+  1. `-D 0.0.0.0:1080` plus strikte `INPUT`-Regeln (nur `lo` und
+     `br-sandbox` duerfen auf den Port). Einfach, Ordnungsunabhaengig,
+     Sicherheit kommt aus der Firewall. **Vorschlag.**
+  2. `-D ${GW_IP}:1080` - schmalstes Binding, aber die Unit haengt davon ab,
+     dass das Docker-Netz schon existiert. Bootreihenfolge wird fragil.
+  3. Ein Dummy-Interface mit fester IP auf dem Host, an das `ssh` bindet.
+     Sauber und docker-unabhaengig, aber zusaetzlicher Host-Zustand.
+* Der Container startet unabhaengig davon. Ist der Tunnel weg, scheitert
+  redsocks beim Verbindungsaufbau und der Healthcheck des Gateways schlaegt an -
+  die Anwendung bekommt Verbindungsfehler, nie aber einen direkten Weg.
+
+### 5.5 Variante "alles auf dem Host" (dokumentiert, nicht Default)
+
+Falls der Host ohnehin Ubuntu ist und kein zusaetzlicher Container gewuenscht
+wird, kann die gesamte Proxy-Schicht auf den Host wandern. Der Container ist
+dann voellig unveraendert - keine Capabilities, keine Zusatzpakete, kein
+Entrypoint-Eingriff.
+
+Technisch tragfaehig, weil `REDIRECT` laut `iptables-extensions(8)` nicht nur
+in `OUTPUT`, sondern auch in **`PREROUTING`** gueltig ist: "This target is only
+valid in the nat table, in the PREROUTING and OUTPUT chains". Und: "It
+redirects the packet to the machine itself by changing the destination IP to
+the primary address of the incoming interface". Fuer Pakete, die auf
+`br-sandbox` ankommen, wird das Ziel also die Bridge-IP - redsocks muss dort
+lauschen, nicht auf `127.0.0.1`.
+
+```sh
+iptables -t nat -A PREROUTING -i br-sandbox -d "${SUBNET}" -j RETURN
+iptables -t nat -A PREROUTING -i br-sandbox -p tcp -j REDIRECT --to-ports 12345
+```
+
+Angenehmer Nebeneffekt: TCP erreicht `FORWARD` dann gar nicht mehr, weil es
+vorher lokal zugestellt wird. `DOCKER-USER` wird zur reinen Rueckfallebene fuer
+UDP, ICMP und alles Uebrige.
+
+Preis: redsocks und unbound muessen auf dem Host installiert und per systemd
+betrieben werden; auf Rocky ist redsocks nicht ohne Weiteres paketiert. Ausserdem
+braucht unbound auf dem Host eine gezielte Regel, damit seine eigenen
+Upstream-Anfragen im Tunnel landen - `-m owner --uid-owner` ist laut
+`iptables-extensions(8)` nur in `OUTPUT` und `POSTROUTING` gueltig, was hier
+genau passt:
+
+```sh
+iptables -t nat -A OUTPUT -m owner --uid-owner sandbox-dns -p tcp --dport 53 \
+         -j REDIRECT --to-ports 12346
+```
+
+(Bei lokal erzeugten Paketen landet REDIRECT auf `127.0.0.1`, deshalb ein
+zweiter redsocks-Listener auf der Loopback-Adresse.)
 
 ---
 
-## 4. Dateien
+## 6. Root und CPU-Durchsatz
 
-Die von dir vorgeschlagene Struktur bleibt erhalten, mit drei bewussten
-Abweichungen (Begruendung darunter):
+Das ist der Punkt, an dem ich deiner Annahme widersprechen muss, und zwar
+aus zwei Richtungen.
+
+### 6.1 Root macht eine Anwendung nicht schneller
+
+Der Linux-Scheduler kennt keine Bevorzugung nach UID. Es gibt keinen
+Codepfad, in dem UID 0 mehr CPU-Zeit bekommt als UID 1000. Was root
+tatsaechlich kann und woher die Beobachtung stammt, sind **Capabilities und
+Rlimits**, nicht der Scheduler:
+
+| Beobachteter Effekt | Tatsaechliche Ursache | Gezielt gewaehrbar durch |
+|---|---|---|
+| Hoehere Prioritaet | negativer `nice`-Wert oder Echtzeit-Policy | `CAP_SYS_NICE` |
+| Kein Swapping/Paging kritischer Puffer | `mlock()` ueber das Rlimit hinaus | `CAP_IPC_LOCK` bzw. `RLIMIT_MEMLOCK` |
+| Mehr offene Dateien, mehr Threads | `RLIMIT_NOFILE`, `RLIMIT_NPROC` | `ulimits` |
+| Zugriff auf Hugepages, MSRs, perf-Counter | eigene Rechte-/Sysctl-Pfade | Host-Konfiguration |
+| Anwendung faellt nicht in einen langsamen Pfad zurueck | Programm versucht `sched_setscheduler()` und faengt den `EPERM` ab | `CAP_SYS_NICE` |
+
+Der letzte Punkt ist erfahrungsgemaess der haeufigste: viele HPC- und
+Laufzeitbibliotheken versuchen Prioritaet oder Pinning zu setzen und schalten
+bei `EPERM` still auf ein konservativeres Verhalten um. Das sieht dann aus wie
+"als root schneller", ist aber eine fehlende Capability.
+
+### 6.2 In einem Container ist root ohnehin der Normalfall
+
+Docker startet Container per Default als root - aber mit einem reduzierten
+Capability-Set. Das Set ist im Docker-Quelltext definiert und enthaelt:
+`CHOWN`, `DAC_OVERRIDE`, `FSETID`, `FOWNER`, `MKNOD`, `NET_RAW`, `SETGID`,
+`SETUID`, `SETFCAP`, `SETPCAP`, `NET_BIND_SERVICE`, `SYS_CHROOT`, `KILL`,
+`AUDIT_WRITE`.
+
+Bemerkenswert ist, was **fehlt**: `NET_ADMIN`, `SYS_NICE`, `IPC_LOCK`,
+`SYS_ADMIN`, `SYS_RESOURCE`. Daraus folgen zwei Dinge:
+
+1. **Deine Anwendung kann als root laufen, ohne die Firewall zu gefaehrden** -
+   ohne `CAP_NET_ADMIN` kann auch root keine iptables-Regel aendern. Der
+   Zielkonflikt aus Revision 1 loest sich damit auf.
+2. **Root allein bringt dir die erhofften Performance-Rechte gar nicht** -
+   `CAP_SYS_NICE` und `CAP_IPC_LOCK` sind nicht dabei und muessen einzeln
+   nachgereicht werden.
+
+### 6.3 Was den CPU-Durchsatz im Container wirklich kostet
+
+Reine Rechenlast laeuft im Container nativ - es gibt keine Instruktions-
+Virtualisierung, nur Namespaces und cgroups. Messbare Effekte kommen aus
+genau vier Ecken:
+
+1. **CFS-Bandwidth-Throttling.** Das ist die mit Abstand haeufigste Ursache
+   fuer unerwartet schlechten Durchsatz. Die Kernel-Dokumentation beschreibt
+   den Mechanismus so: innerhalb jeder Periode bekommt eine Gruppe ein
+   Kontingent an CPU-Mikrosekunden zugeteilt; ist es aufgebraucht, werden die
+   Threads gedrosselt und koennen erst in der naechsten Periode wieder laufen.
+   Bei vielen Threads ist das Kontingent oft vorzeitig weg und die Anwendung
+   steht periodisch still.
+   **Konsequenz fuer uns: kein `cpus:` und kein `cpu_quota` setzen.** Wer
+   begrenzen will, nimmt `cpuset` (feste CPU-Liste) - das pinnt, ohne zu
+   drosseln, und verbessert nebenbei die Cache- und NUMA-Lokalitaet.
+2. **seccomp.** Docker filtert Syscalls per Default ueber ein seccomp-Profil.
+   Fuer rechengebundene Lasten ist das bedeutungslos, fuer syscall-lastige
+   Lasten messbar. `security_opt: ["seccomp=unconfined"]` schaltet es ab -
+   das schwaecht die Isolation und gehoert nur hinein, wenn eine **Messung**
+   den Gewinn zeigt. Nicht ungemessen setzen.
+3. **Speicher- und NUMA-Platzierung.** `cpuset` plus passende
+   `cpuset_mems`-Zuordnung auf dem Host, `shm_size` gross genug fuer
+   Shared-Memory-Kommunikation, `ulimits: memlock` fuer gepinnte Seiten.
+4. **Die Proxy-Schicht - aber nur fuer Netzverkehr.** redsocks ist ein
+   Userspace-Relay; jedes uebertragene Byte kostet CPU. Fuer eine
+   rechengebundene Anwendung mit wenig Netz-I/O ist das irrelevant. Fuer eine
+   datenintensive Anwendung wird redsocks zum Flaschenhals.
+   Gegenmassnahme: redsocks bietet `splice = true` - einen Datenpfad ueber
+   `splice(2)`, der die Nutzdaten im Kernel haelt, statt sie durch den
+   Userspace zu kopieren. Laut Konfigurationsbeispiel ist das auf modernen
+   Kerneln ohnehin der Default. Zusaetzlich laeuft redsocks in einem
+   **eigenen** Container und damit in einer eigenen cgroup - seine CPU-Zeit
+   wird der Anwendung nicht angerechnet und stoert deren Messungen nicht.
+
+### 6.4 Resultierende Compose-Einstellungen fuer den App-Container
+
+```yaml
+  app:
+    network_mode: "service:gateway"
+    cap_drop: [ALL]
+    # cap_add: [SYS_NICE]        # nur, wenn die Anwendung Prioritaet/Pinning setzt
+    init: true                    # sauberes PID 1 fuer Zombie-Reaping
+    cpuset: "${APP_CPUSET:-}"     # Pinning statt Drosselung
+    # cpus: NICHT setzen -> keine CFS-Drosselung
+    shm_size: "${APP_SHM_SIZE:-1g}"
+    ulimits:
+      memlock: -1
+      nofile: 1048576
+    # security_opt: ["seccomp=unconfined"]   # nur nach Messung
+```
+
+Die auskommentierten Zeilen sind bewusst auskommentiert: jede davon tauscht
+Isolation gegen Performance und gehoert nur aktiviert, wenn eine Messung den
+Gewinn belegt. Der Testplan (Abschnitt 9) sieht dafuer einen Referenzlauf vor.
+
+---
+
+## 7. Dateien
 
 ```
 .
-|-- PLAN.md                    # dieses Dokument
-|-- README.md                  # Dokumentation, Betrieb, Troubleshooting
-|-- Dockerfile                 # (statt "dockerfile", s. u.)
+|-- PLAN.md
+|-- README.md
 |-- docker-compose.yml
-|-- .env.example               # (statt ".env", s. u.)
-|-- .gitignore                 # .env, Keys, known_hosts
-|-- run.sh                     # Lifecycle: build / up / shell / test / down
-|-- apply-rules.sh             # Host-Firewall (DOCKER-USER + INPUT)
-|-- blocked-subnets.conf       # Ziel-Netze, die der Sandbox verboten sind
-|-- container/
-|   |-- entrypoint.sh          # Startreihenfolge im Container
-|   |-- firewall.sh            # Container-interne iptables-Regeln
-|   |-- healthcheck.sh         # Tunnel + Proxy + DNS lebendig?
+|-- Dockerfile                  # App-Container: Basis + Anwendung, sonst nichts
+|-- .env.example                # (statt ".env", s. u.)
+|-- .gitignore
+|-- run.sh                      # Lifecycle: build / up / shell / test / down
+|-- apply-rules.sh              # Host-Firewall (INPUT + DOCKER-USER)
+|-- blocked-subnets.conf        # Ziel-Netze, die der Sandbox verboten sind
+|-- gateway/
+|   |-- Dockerfile              # redsocks + unbound + iptables
+|   |-- entrypoint.sh
+|   |-- firewall.sh             # Regeln im gemeinsamen Namespace
+|   |-- healthcheck.sh
+|   |-- resolv.conf             # wird in den App-Container gemountet
 |   |-- redsocks.conf.tmpl
 |   `-- unbound.conf.tmpl
+|-- host/
+|   |-- sandbox-tunnel.service  # systemd-Unit fuer ssh -D
+|   `-- sandbox-tunnel.env
 `-- tests/
-    `-- leak-test.sh           # Nachweis, dass nichts vorbeilaeuft
+    |-- leak-test.sh            # Nachweis, dass nichts vorbeilaeuft
+    `-- perf-baseline.sh        # Durchsatz im Container vs. auf dem Host
 ```
 
-Abweichungen:
+Abweichungen von deiner urspruenglichen Liste:
 
 1. **`Dockerfile` statt `dockerfile`** - `docker build` sucht per Default exakt
-   nach `Dockerfile`; auf case-sensitiven Dateisystemen wuerde die
-   Kleinschreibung nur mit explizitem `-f` funktionieren. Compose setzt
-   `dockerfile:` zwar explizit, aber der direkte `docker build`-Aufruf soll
-   auch klappen.
+   nach `Dockerfile`; auf case-sensitiven Dateisystemen braeuchte die
+   Kleinschreibung ein explizites `-f`.
 2. **`.env.example` im Repo, `.env` in `.gitignore`** - die `.env` enthaelt
-   Hostnamen, Benutzernamen und Pfade zu Schluesseln. Die gehoeren nicht ins
-   Git. Die Beispieldatei dokumentiert alle Variablen vollstaendig.
-3. **Unterverzeichnisse `container/` und `tests/`** - haelt das Wurzelverzeichnis
-   bei der von dir gewuenschten Uebersichtlichkeit, obwohl mehrere
-   Hilfsdateien dazukommen.
+   Hostnamen, Benutzernamen und Schluesselpfade.
+3. **`gateway/`, `host/`, `tests/`** - haelt das Wurzelverzeichnis
+   uebersichtlich.
 
 ---
 
-## 5. Umsetzung je Datei
+## 8. Umsetzung je Datei
 
-### 5.1 `Dockerfile`
+### 8.1 `Dockerfile` (App-Container)
 
-* `ARG BASE_IMAGE=ubuntu:26.04` - austauschbar, damit die Sandbox auch auf
-  einem anderen Unterbau gebaut werden kann.
-* Pakete: `openssh-client`, `autossh`, `redsocks`, `unbound`, `iptables`,
-  `iproute2`, `ca-certificates`, `curl`, `dnsutils`, `netcat-openbsd`, `tini`.
-  Alle in Ubuntu 26.04 vorhanden (`redsocks`/`autossh` aus `universe`).
-* `ARG APP_PACKAGES=""` - zusaetzliche apt-Pakete der Zielanwendung, per
-  `.env` steuerbar. Optional `COPY app/ /opt/app` plus Aufruf von
-  `/opt/app/install.sh`, falls vorhanden - damit ist "beliebige Anwendung"
-  ohne Aenderung am Dockerfile moeglich.
-* Zwei feste, nicht-privilegierte Benutzer:
-  * `sandbox` (`APP_UID`, Default 10001) - fuehrt die Anwendung aus.
-  * `tunnel` (`PROXY_UID`, Default 10002) - fuehrt `ssh` und `redsocks` aus.
-    Dieser UID ist der einzige, der die Firewall passieren darf. Die Trennung
-    ist das Fundament der ganzen Konstruktion, weil `iptables -m owner` genau
-    auf diesen UID matcht.
-* `ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint.sh"]`,
-  `CMD` kommt aus `.env` (`APP_CMD`).
-* Kein `apt-get upgrade` im Image-Build, stattdessen Base-Image-Pinning per
-  Digest als Option - reproduzierbare Builds statt beweglicher Ziele.
+Bewusst minimal - hier laeuft die durchsatzkritische Anwendung, also kommt
+nichts hinein, was sie stoeren koennte:
 
-### 5.2 `container/firewall.sh` (laeuft als root im Container, vor der App)
+* `ARG BASE_IMAGE=ubuntu:26.04`, optional per Digest gepinnt.
+* `ARG APP_PACKAGES=""` fuer apt-Pakete der Anwendung; optional
+  `COPY app/ /opt/app` plus Aufruf von `/opt/app/install.sh`, falls vorhanden.
+  Damit ist "beliebige Anwendung" ohne Aenderung am Dockerfile moeglich.
+* **Kein** ssh, **kein** redsocks, **kein** unbound, **kein** iptables,
+  **kein** Entrypoint-Eingriff ins Netz. Die Anwendung startet direkt als root.
+* `/etc/resolv.conf` kommt per Bind-Mount aus `gateway/resolv.conf`
+  (Inhalt: `nameserver 127.0.0.1`, `options timeout:2 attempts:2`).
+  Begruendung siehe 8.5.
+
+### 8.2 `gateway/Dockerfile`
+
+`redsocks`, `unbound`, `iptables`, `iproute2`, `curl`, `netcat-openbsd`,
+`gettext-base` (fuer `envsubst`). Alle in Ubuntu 26.04 vorhanden
+(`redsocks` aus universe, `unbound` aus main). Zwei dedizierte
+unprivilegierte Benutzer:
+
+* `redsocks` (Default-UID 10002) - der einzige UID, dessen Pakete die
+  Firewall passieren duerfen.
+* `unbound` (Default-UID 10003) - dessen Upstream-Anfragen normal in den
+  REDIRECT laufen.
+
+### 8.3 `gateway/firewall.sh`
 
 ```sh
 # --- NAT: TCP transparent in redsocks umlenken ---
 iptables -t nat -N SANDBOX_REDIR
-iptables -t nat -A SANDBOX_REDIR -m owner --uid-owner "${PROXY_UID}" -j RETURN
-iptables -t nat -A SANDBOX_REDIR -d 127.0.0.0/8                      -j RETURN
-iptables -t nat -A SANDBOX_REDIR -d "${SANDBOX_SUBNET}"              -j RETURN
+iptables -t nat -A SANDBOX_REDIR -m owner --uid-owner "${REDSOCKS_UID}" -j RETURN
+iptables -t nat -A SANDBOX_REDIR -d 127.0.0.0/8          -j RETURN
+iptables -t nat -A SANDBOX_REDIR -d "${SANDBOX_SUBNET}"  -j RETURN
 iptables -t nat -A SANDBOX_REDIR -p tcp -j REDIRECT --to-ports "${REDSOCKS_PORT}"
 iptables -t nat -A OUTPUT -p tcp -j SANDBOX_REDIR
 
-# --- FILTER: alles zu, ausser Loopback und dem Tunnel selbst ---
-iptables -P INPUT   DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT  DROP
+# --- FILTER: alles zu, ausser Loopback und dem Weg zum SOCKS-Port ---
+iptables -P INPUT DROP; iptables -P FORWARD DROP; iptables -P OUTPUT DROP
 iptables -A INPUT  -i lo -j ACCEPT
 iptables -A OUTPUT -o lo -j ACCEPT
 iptables -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -p tcp -d "${SSH_HOST_IP}" --dport "${SSH_PORT}" \
-                   -m owner --uid-owner "${PROXY_UID}" -j ACCEPT
+iptables -A OUTPUT -p tcp -d "${GW_IP}" --dport "${SOCKS_PORT}" \
+                   -m owner --uid-owner "${REDSOCKS_UID}" -j ACCEPT
 
 # --- IPv6 vollstaendig zu ---
 ip6tables -P INPUT DROP; ip6tables -P FORWARD DROP; ip6tables -P OUTPUT DROP
 ip6tables -A INPUT -i lo -j ACCEPT; ip6tables -A OUTPUT -o lo -j ACCEPT
 ```
 
-Wichtige Details, die leicht uebersehen werden:
+Details, die leicht uebersehen werden:
 
-* Die `-m owner`-Matches sind laut `iptables-extensions(8)` **nur in OUTPUT und
-  POSTROUTING** gueltig - genau dort setzen wir sie ein. In FORWARD-Ketten gibt
-  es keinen Socket-Owner, deshalb funktioniert dieser Trick auf dem Host nicht
-  und wir brauchen dort eine IP-basierte Allowlist.
-* Der RETURN fuer `PROXY_UID` in der NAT-Kette verhindert die Schleife
+* Der `RETURN` fuer `REDSOCKS_UID` in der NAT-Kette verhindert die Schleife
   "redsocks -> REDIRECT -> redsocks".
+* `-m owner` ist laut `iptables-extensions(8)` nur in `OUTPUT` und
+  `POSTROUTING` gueltig - genau dort wird es eingesetzt. Fuer weitergeleitete
+  Pakete gibt es keinen Socket-Owner, deshalb funktioniert derselbe Trick auf
+  dem Host nicht und dort wird IP- und interface-basiert gefiltert.
 * Nach dem REDIRECT hat das Paket das Ziel `127.0.0.1` und verlaesst den
-  Stack ueber `lo` - die Regel `-A OUTPUT -o lo -j ACCEPT` deckt es also ab.
-* `ALLOW_LAN=0` (Default): keine Regel fuer `${SANDBOX_SUBNET}` in `OUTPUT`.
-  Wer Nachbarcontainer erreichen will, setzt `ALLOW_LAN=1`.
-* `SSH_HOST` muss als **IP-Adresse** vorliegen oder wird beim Start einmalig
-  aufgeloest, *bevor* die Policy auf DROP geht. Sonst entsteht ein
-  Henne-Ei-Problem: `ssh` braucht DNS, DNS braucht den Tunnel. Die aufgeloeste
-  IP wird zusaetzlich in `/etc/hosts` gepinnt.
+  Stack ueber `lo` - `-A OUTPUT -o lo -j ACCEPT` deckt es also ab.
+* Die Regeln liegen im **gemeinsamen** Namespace und gelten damit auch fuer
+  den App-Container, obwohl der sie nicht sehen oder aendern kann.
 
-### 5.3 `apply-rules.sh` (Host, root)
+### 8.4 `apply-rules.sh` (Host, root)
 
-Baut eine eigene Kette `SANDBOX_EGRESS` und haengt sie an **Position 1** in
-`DOCKER-USER`. Laut Docker-Dokumentation ist `DOCKER-USER` genau dafuer
-vorgesehen: "A placeholder for user-defined rules that will be processed before
-rules in the `DOCKER-FORWARD` and `DOCKER` chains." Regeln, die stattdessen an
-`FORWARD` angehaengt werden, laufen zu spaet.
+Zwei Ketten, beide interface-basiert:
 
 ```sh
-iptables -N SANDBOX_EGRESS 2>/dev/null || iptables -F SANDBOX_EGRESS
-iptables -C DOCKER-USER -s "${SANDBOX_SUBNET}" -j SANDBOX_EGRESS 2>/dev/null \
-  || iptables -I DOCKER-USER 1 -s "${SANDBOX_SUBNET}" -j SANDBOX_EGRESS
+# Linie 2: was die Sandbox vom Host selbst erreichen darf
+iptables -N SANDBOX_IN 2>/dev/null || iptables -F SANDBOX_IN
+iptables -A SANDBOX_IN -p tcp --dport "${SOCKS_PORT}" -j ACCEPT
+iptables -A SANDBOX_IN -j DROP
+iptables -C INPUT -i "${BRIDGE}" -j SANDBOX_IN 2>/dev/null \
+  || iptables -I INPUT 1 -i "${BRIDGE}" -j SANDBOX_IN
 
-iptables -A SANDBOX_EGRESS -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+# Linie 3: was weitergeleitet werden darf - naemlich nichts
+iptables -N SANDBOX_EGRESS 2>/dev/null || iptables -F SANDBOX_EGRESS
 iptables -A SANDBOX_EGRESS -d "${SANDBOX_SUBNET}" -j RETURN
-iptables -A SANDBOX_EGRESS -p tcp -d "${SSH_HOST_IP}" --dport "${SSH_PORT}" -j RETURN
-# ... danach jede Zeile aus blocked-subnets.conf als DROP ...
-iptables -A SANDBOX_EGRESS -j DROP          # Default-Deny am Ende
+# ... je Zeile aus blocked-subnets.conf ein DROP ...
+iptables -A SANDBOX_EGRESS -j DROP
+iptables -C DOCKER-USER -i "${BRIDGE}" -j SANDBOX_EGRESS 2>/dev/null \
+  || iptables -I DOCKER-USER 1 -i "${BRIDGE}" -j SANDBOX_EGRESS
 ```
 
-Zwei Punkte, die in den meisten Anleitungen im Netz fehlen und die das Skript
-deshalb explizit behandeln muss:
-
-* **`DOCKER-USER` deckt nur weitergeleiteten Verkehr ab.** Pakete vom Container
-  an den Host selbst (Bridge-Gateway-IP, also z. B. ein Dienst auf dem Host)
-  laufen ueber `INPUT`, nicht ueber `FORWARD`. Ohne zusaetzliche
-  `INPUT`-Regel kann die Sandbox also Host-Dienste erreichen. Das Skript legt
-  darum eine zweite Kette `SANDBOX_HOST_IN` an, die von `INPUT` aus dem
-  Bridge-Interface gerufen wird. In Variante B ist dort genau ein ACCEPT fuer
-  den SOCKS-Port noetig, sonst nur DROP.
-* **Die Reihenfolge ist Programm.** Der conntrack-RETURN und die Allowlist
-  muessen vor den DROPs stehen, sonst bricht der Tunnel selbst ab.
+`DOCKER-USER` ist laut Docker-Dokumentation genau dafuer da: "A placeholder
+for user-defined rules that will be processed before rules in the
+`DOCKER-FORWARD` and `DOCKER` chains." An `FORWARD` angehaengte Regeln laufen
+zu spaet.
 
 Skript-Eigenschaften:
 
-* Unterbefehle bzw. Schalter: `--apply` (Default), `--remove`, `--status`,
-  `--dry-run` (gibt die Regeln aus, ohne sie zu setzen).
-* Idempotent: mehrfacher Aufruf erzeugt keine Duplikate (Kette wird geleert und
-  neu gefuellt, Sprung nur bei Bedarf eingefuegt).
-* Subnetz-Ermittlung wahlweise aus `.env` (`SANDBOX_SUBNET`) oder per
-  `docker network inspect`.
-* Hinweis auf fehlende Persistenz: Nach einem Reboot sind die Regeln weg.
-  `run.sh` ruft `apply-rules.sh` deshalb bei jedem Start auf; optional wird im
-  README eine systemd-Unit beschrieben.
-* Interaktion mit `ufw`/`firewalld` wird im README benannt - Docker umgeht
-  `ufw` bekanntermassen, weil es im NAT-Pfad vor `INPUT`/`OUTPUT` eingreift.
+* Schalter: `--apply` (Default), `--remove`, `--status`, `--dry-run`.
+* Idempotent: Ketten werden geleert und neu gefuellt, der Sprung nur bei
+  Bedarf eingefuegt.
+* Keine Persistenz ueber einen Reboot - `run.sh` ruft das Skript bei jedem
+  Start auf; im README wird alternativ eine systemd-Unit beschrieben.
+* Hinweis auf `ufw`/`firewalld`: Docker greift im NAT-Pfad vor `INPUT`/`OUTPUT`
+  ein und umgeht `ufw`-Regeln; das gehoert ins README, damit niemand sich auf
+  `ufw status` verlaesst.
 
-### 5.4 `blocked-subnets.conf`
+### 8.5 DNS-Verdrahtung
 
-Format: ein CIDR pro Zeile, `#` als Kommentar, Leerzeilen erlaubt.
-Default-Inhalt entspricht deiner Vorgabe "alles ausser dem containerinternen
-Netz":
+`unbound` lauscht im Gateway auf `127.0.0.1:53`, der App-Container erreicht
+das ueber den gemeinsamen Namespace. Der Weg ueber Dockers eingebetteten
+Resolver (`127.0.0.11`) wird umgangen, indem `/etc/resolv.conf` im
+App-Container per Bind-Mount fest auf `nameserver 127.0.0.1` gesetzt wird.
 
-```
-# Destinations that the sandbox subnet must not reach.
-# Evaluated AFTER the allow-list (SSH endpoint, container subnet, established).
-# Default: deny the entire IPv4 space.
-0.0.0.0/0
+**Zu pruefen im PoC:** ob Compose `dns:` zusammen mit
+`network_mode: "service:..."` ueberhaupt akzeptiert. Der Bind-Mount ist der
+deterministische Weg und deshalb der Vorschlag; `dns:` waere nur die
+elegantere Variante, falls sie funktioniert.
 
-# Less strict example - comment out 0.0.0.0/0 first:
-#10.0.0.0/8
-#172.16.0.0/12
-#192.168.0.0/16
-#169.254.0.0/16
-```
-
-### 5.5 `container/redsocks.conf.tmpl`
-
-Wird beim Start aus `.env` mit `envsubst` gefuellt. Belegte Optionen aus der
-Beispielkonfiguration des Projekts:
-
-```
-base {
-    log_debug  = off;
-    log_info   = on;
-    log        = "stderr";
-    daemon     = off;
-    user       = tunnel;
-    group      = tunnel;
-    redirector = iptables;
-}
-
-redsocks {
-    local_ip   = 127.0.0.1;
-    local_port = 12345;
-    ip         = 127.0.0.1;     /* ssh -D listener, Variante A */
-    port       = 1080;
-    type       = socks5;
-}
-```
-
-`user`/`group` sind hier sicherheitsrelevant und nicht kosmetisch: redsocks
-legt damit den UID fest, auf den die `-m owner`-Ausnahme matcht.
-
-### 5.6 `container/unbound.conf.tmpl`
-
-```
-server:
-    interface: 127.0.0.1
-    port: 53
-    access-control: 127.0.0.0/8 allow
-    do-ip6: no
-    hide-identity: yes
-    hide-version: yes
-    tcp-upstream: yes          # zwingt Upstream-Queries auf TCP -> Tunnel
-
-forward-zone:
-    name: "."
-    forward-addr: ${DNS_UPSTREAM}
-```
-
-### 5.7 `container/entrypoint.sh`
-
-Programmablaufplan:
-
-1. `.env`-Variablen pruefen, Pflichtwerte validieren, sonst Abbruch mit klarer
-   Meldung.
-2. `SSH_HOST` zu einer IP aufloesen (solange noch Netz da ist) und in
-   `/etc/hosts` pinnen.
-3. Templates rendern (`redsocks.conf`, `unbound.conf`).
-4. `firewall.sh` ausfuehren - ab hier ist die Policy `DROP`.
-5. `unbound` starten, auf Port 53 warten.
-6. `autossh`/`ssh -D` als `tunnel` starten
-   (`-N -o ExitOnForwardFailure=yes -o ServerAliveInterval=15
-   -o ServerAliveCountMax=3 -o StrictHostKeyChecking=yes`).
-7. Auf den SOCKS-Port warten (Timeout `TUNNEL_WAIT`, Default 30 s); kommt er
-   nicht hoch, mit Fehler abbrechen, statt die App ohne Netz zu starten.
-8. `redsocks` als `tunnel` starten, auf Port 12345 warten.
-9. Optionaler Selbsttest (`EGRESS_SELFTEST=1`): eine TCP-Verbindung nach
-   aussen, Vergleich der oeffentlichen IP.
-10. Umgebung fuer den nicht-transparenten Fallback setzen
-    (`ALL_PROXY=socks5h://127.0.0.1:1080`, `HTTP_PROXY`, `HTTPS_PROXY`,
-    `NO_PROXY=localhost,127.0.0.1`).
-11. Privilegien ablegen und `APP_CMD` als `sandbox` ausfuehren
-    (`setpriv --reuid ... --regid ... --init-groups --no-new-privs`).
-
-`StrictHostKeyChecking=yes` mit eingebundener `known_hosts` ist bewusst
-gesetzt: ein SOCKS-Tunnel zu einem nicht verifizierten Host ist eine
-Einladung zum MITM und wuerde die gesamte Schutzwirkung aufheben.
-
-### 5.8 `docker-compose.yml` (Auszug)
-
-```yaml
-services:
-  sandbox:
-    build:
-      context: .
-      args:
-        BASE_IMAGE: ${BASE_IMAGE:-ubuntu:26.04}
-    cap_drop: [ALL]
-    cap_add:  [NET_ADMIN, SETUID, SETGID]
-    security_opt: ["no-new-privileges:true"]
-    sysctls:
-      net.ipv6.conf.all.disable_ipv6: "1"
-    dns: ["127.0.0.1"]
-    networks: [sandbox_net]
-    healthcheck:
-      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
-      interval: 30s
-      start_period: 30s
-    restart: unless-stopped
-
-networks:
-  sandbox_net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: ${SANDBOX_SUBNET:-172.28.77.0/24}
-```
-
-Das Subnetz wird **fest vergeben**, weil `apply-rules.sh` es als Match-Kriterium
-braucht - ein von Docker frei gewaehltes Subnetz wuerde die Host-Regeln nach
-jedem `docker compose down` ins Leere laufen lassen.
-
-`cap_add: NET_ADMIN` wird nur fuer das Setzen der Regeln im Entrypoint
-gebraucht. Da die Anwendung unprivilegiert laeuft, kann sie die Capability
-nicht nutzen.
-
-### 5.9 `.env.example`
+### 8.6 `.env.example`
 
 ```
 # --- Basis ---
 BASE_IMAGE=ubuntu:26.04
-CONTAINER_NAME=sandbox-socks5
 APP_CMD=/bin/bash
 APP_PACKAGES=
 
 # --- Netz ---
 SANDBOX_SUBNET=172.28.77.0/24
-APP_UID=10001
-PROXY_UID=10002
-ALLOW_LAN=0
-
-# --- Tunnel (PROXY_MODE=internal: ssh im Container) ---
-PROXY_MODE=internal
-SSH_HOST=203.0.113.10
-SSH_PORT=22
-SSH_USER=tunneluser
-SSH_KEY_FILE=./secrets/id_ed25519
-SSH_KNOWN_HOSTS=./secrets/known_hosts
+GW_IP=172.28.77.1
+BRIDGE=br-sandbox
 SOCKS_PORT=1080
 REDSOCKS_PORT=12345
-TUNNEL_WAIT=30
-
-# --- Tunnel (PROXY_MODE=external: SOCKS5 liegt ausserhalb) ---
-#PROXY_HOST=172.28.77.1
-#PROXY_PORT=1080
+REDSOCKS_UID=10002
 
 # --- DNS ---
-DNS_MODE=unbound
+DNS_MODE=unbound          # unbound | dnstc | host
 DNS_UPSTREAM=9.9.9.9
 
-# --- Host-Regeln ---
+# --- Performance ---
+APP_CPUSET=
+APP_SHM_SIZE=1g
+APP_CAP_SYS_NICE=0
+APP_SECCOMP_UNCONFINED=0
+
+# --- Host ---
 APPLY_HOST_RULES=1
 EGRESS_SELFTEST=1
 ```
 
-### 5.10 `run.sh`
+### 8.7 `run.sh`
 
-Unterbefehle: `build`, `up`, `down`, `shell`, `status`, `test`, `logs`.
-Ablauf bei `up`:
+Unterbefehle `build`, `up`, `down`, `shell`, `status`, `test`, `logs`.
+Bei `up`: Vorbedingungen pruefen (Docker, Compose, `.env`, Tunnel erreichbar)
+-> `apply-rules.sh --apply` -> `docker compose up -d` -> auf `healthy` warten
+-> bei `EGRESS_SELFTEST=1` den Leak-Test starten.
 
-1. Vorbedingungen pruefen (`docker`, `docker compose`, `.env`, Key-Datei,
-   `known_hosts` vorhanden und nicht leer).
-2. Bei `APPLY_HOST_RULES=1`: `apply-rules.sh --apply` (mit `sudo`, falls noetig).
-3. `docker compose up -d --build`.
-4. Auf `healthy` warten.
-5. Bei `EGRESS_SELFTEST=1`: `tests/leak-test.sh` starten und Ergebnis anzeigen.
+Wichtig: `run.sh` prueft **vor** dem Start, ob der Tunnel auf dem Host laeuft,
+und meldet sonst klar, dass der Container ohne Netz hochkommt.
 
-### 5.11 `README.md`
+### 8.8 `README.md`
 
-Gliederung: Zweck und Bedrohungsmodell / Voraussetzungen / Schnellstart /
-Konfigurationsreferenz (jede `.env`-Variable) / Betrieb / bekannte
-Einschraenkungen (kein UDP, kein ICMP, kein QUIC) / Troubleshooting
-(typische Symptome und ihre Ursache) / Sicherheitshinweise / Deinstallation
-(`apply-rules.sh --remove`).
+Zweck und Bedrohungsmodell / Voraussetzungen (inkl. Tunnel-Unit) /
+Schnellstart / Konfigurationsreferenz / Betrieb / bekannte Einschraenkungen
+(kein UDP, kein ICMP, kein QUIC, DNS-Latenz) / Performance-Hinweise
+(Abschnitt 6) / Troubleshooting / Deinstallation.
 
 ---
 
-## 6. Leak-Analyse
+## 9. Testplan
+
+### 9.1 Leak-Tests (`tests/leak-test.sh`)
+
+| # | Test | Erwartung |
+|---|---|---|
+| 1 | `curl -s https://ifconfig.co` im Container | liefert die IP des SSH-Servers, nicht die des Hosts |
+| 2 | `getent hosts example.com` | loest auf |
+| 3 | `dig +notcp @8.8.8.8 example.com` | Timeout (kein UDP-DNS nach draussen) |
+| 4 | `dig +tcp @${DNS_UPSTREAM} example.com` | antwortet (DNS ueber TCP funktioniert) |
+| 5 | `ping -c1 -W2 1.1.1.1` | schlaegt fehl |
+| 6 | `curl -6 -m5 https://ipv6.google.com` | schlaegt fehl |
+| 7 | `nc -z -w2 ${GW_IP} 22` | schlaegt fehl (nur SOCKS-Port erlaubt) |
+| 8 | Tunnel-Unit auf dem Host stoppen, dann `curl` | schlaegt fehl, geht **nicht** direkt hinaus |
+| 9 | Regeln im gemeinsamen Namespace leeren (Wegwerf-Instanz mit NET_ADMIN), dann `curl` | schlaegt trotzdem fehl - Nachweis fuer Linie 2 und 3 |
+| 10 | Container-IP von innen auf eine Adresse ausserhalb des Subnetzes aendern (Wegwerf-Instanz mit NET_ADMIN), dann `curl` | schlaegt fehl - Nachweis fuer das Interface-Matching |
+
+Tests 9 und 10 laufen bewusst in einer Wegwerf-Instanz mit `CAP_NET_ADMIN`,
+nicht in der produktiven.
+
+### 9.2 Performance-Referenz (`tests/perf-baseline.sh`)
+
+Ziel: belegen, dass die Sandbox den CPU-Durchsatz nicht kostet, statt es zu
+behaupten.
+
+1. Referenzlauf der Anwendung (oder eines Stellvertreters wie `stress-ng
+   --cpu N --metrics-brief` bzw. eines echten Benchmarks) **auf dem Host**.
+2. Derselbe Lauf **im App-Container**, Default-Einstellungen.
+3. Derselbe Lauf mit `cpuset`-Pinning.
+4. Optional: mit `seccomp=unconfined`, mit `cap_add: SYS_NICE`.
+5. Gegenprobe mit gesetztem `cpus:`-Limit, um die CFS-Drosselung sichtbar zu
+   machen - der Unterschied ist das eigentliche Argument gegen diese Option.
+
+Ergebnis gehoert als Tabelle ins README, damit spaetere Aenderungen sich daran
+messen lassen.
+
+---
+
+## 10. Leak-Analyse
 
 | Bypass-Vektor | Gegenmassnahme | Restrisiko |
 |---|---|---|
-| Direkte TCP-Verbindung unter Umgehung von redsocks | `nat/OUTPUT` faengt **alles** TCP; `filter/OUTPUT` Policy DROP als zweite Linie | gering |
-| UDP (QUIC, DNS, NTP) | Policy DROP - UDP wird verworfen, nicht "irgendwie" transportiert | gering; Anwendungen muessen auf TCP zurueckfallen |
-| Docker-interner Resolver `127.0.0.11` -> Host-Resolver | `dns: [127.0.0.1]` + `OUTPUT DROP`; eigener unbound mit `tcp-upstream` | gering, aber **im PoC zu verifizieren** |
-| IPv6 | `disable_ipv6` + `ip6tables` DROP | gering |
-| Anwendung raeumt die Container-Firewall ab | App laeuft unprivilegiert, `no-new-privileges`; Host-Regeln greifen unabhaengig davon | mittel, solange die App im selben Container laeuft -> Ausbaustufe 2 |
-| Zugriff auf Host-Dienste ueber die Gateway-IP | Zusatzkette in `INPUT` (Abschnitt 5.3) | gering |
-| Tunnel bricht weg, App faellt auf Direktverbindung zurueck | Fail-closed by design: ohne Tunnel schlaegt redsocks fehl, ein direkter Weg existiert nicht | gering |
-| Metadaten-Leak beim Aufloesen von `SSH_HOST` | IP in `.env` pinnen oder einmalige Aufloesung vor dem DROP | gering, bewusst akzeptiert |
+| Direkte TCP-Verbindung an redsocks vorbei | `nat/OUTPUT` faengt alles TCP; `filter/OUTPUT` Policy DROP als zweite Linie | gering |
+| UDP (QUIC, DNS, NTP) | Policy DROP - wird verworfen, nicht halb transportiert | gering; Anwendungen muessen TCP koennen |
+| Dockers eingebetteter Resolver `127.0.0.11` | `/etc/resolv.conf` per Bind-Mount fest auf `127.0.0.1` | gering, **im PoC zu verifizieren** |
+| IPv6 | kein IPv6 im Docker-Netz, `ip6tables` DROP | gering |
+| Anwendung (als root) raeumt die Firewall ab | `cap_drop: ALL` im App-Container - ohne `CAP_NET_ADMIN` geht das nicht | gering |
+| Anwendung aendert ihre IP und umgeht das `-s`-Match | Host-Regeln matchen auf `-i ${BRIDGE}` | gering |
+| Zugriff auf Host-Dienste ueber die Gateway-IP | Kette `SANDBOX_IN` in `INPUT` | gering |
+| Tunnel bricht weg, Fallback auf Direktverbindung | fail-closed by design; kein direkter Weg existiert | gering |
+| SOCKS-Port auf `0.0.0.0` erreichbar fuer Dritte | `INPUT`-Regeln beschraenken auf `lo` und `${BRIDGE}` | gering, aber Bindungs-Entscheidung offen (5.4) |
 | Container-Escape / Kernel-Exploit | ausserhalb des Modells | nicht adressiert |
 
 ---
 
-## 7. Testplan (`tests/leak-test.sh`)
-
-Jeder Test gibt PASS/FAIL aus; Exit-Code ungleich 0, sobald einer fehlschlaegt.
-
-1. **Egress-IP** - `curl -s https://ifconfig.co` im Container liefert die
-   oeffentliche IP des SSH-Servers, nicht die des Hosts. (Positivtest)
-2. **DNS funktioniert** - `getent hosts example.com` liefert ein Ergebnis.
-3. **DNS laeuft nicht per UDP hinaus** - `dig +notcp @8.8.8.8 example.com`
-   muss in einen Timeout laufen.
-4. **ICMP blockiert** - `ping -c1 -W2 1.1.1.1` muss fehlschlagen.
-5. **IPv6 blockiert** - `curl -6 -m5 https://ipv6.google.com` muss fehlschlagen.
-6. **Host-Dienste unerreichbar** - `nc -z -w2 ${GATEWAY_IP} 22` muss fehlschlagen.
-7. **Fail-closed** - `pkill ssh` im Container; danach muss jeder
-   `curl`-Aufruf fehlschlagen, nicht direkt hinausgehen.
-8. **Host-Regel wirkt allein** - Container-Firewall leeren
-   (`iptables -P OUTPUT ACCEPT` als root), danach darf `curl` zu einer
-   beliebigen externen IP trotzdem nicht durchkommen. Das ist der
-   entscheidende Test fuer die zweite Verteidigungslinie.
-
-Test 8 laeuft in einem Wegwerf-Container, nicht in der produktiven Instanz.
-
----
-
-## 8. Umsetzungsreihenfolge
+## 11. Meilensteine
 
 | Meilenstein | Inhalt | Ergebnis |
 |---|---|---|
-| **M1** | Manueller PoC: Dockerfile + Entrypoint + redsocks + `ssh -D`, noch ohne Host-Regeln | "Traffic laeuft transparent durch den Tunnel" ist bewiesen |
-| **M2** | DNS (unbound `tcp-upstream`), Container-Firewall, Fail-closed | Sandbox ist von innen dicht |
-| **M3** | `apply-rules.sh`, `blocked-subnets.conf`, INPUT-Kette | zweite Verteidigungslinie steht |
-| **M4** | `run.sh`, Healthcheck, `tests/leak-test.sh` | reproduzierbarer Betrieb, Nachweis per Test |
-| **M5** | `README.md`, `.env.example`, `.gitignore` | uebergabefaehig |
-| **M6** *(optional)* | Sidecar-Variante (`network_mode: service:`) | App ohne `NET_ADMIN` im eigenen Container |
+| **M1** | Tunnel-Unit auf dem Host, Gateway-Container mit redsocks, manueller Test | Traffic laeuft transparent durch den Tunnel |
+| **M2** | DNS ueber TCP (unbound), resolv.conf-Verdrahtung, Fail-closed-Verhalten | Sandbox ist von innen dicht und nutzbar |
+| **M3** | `apply-rules.sh`, `blocked-subnets.conf`, `SANDBOX_IN` + `SANDBOX_EGRESS` | zweite und dritte Verteidigungslinie stehen |
+| **M4** | App-Container, `network_mode: service:`, `cap_drop: ALL`, root-Betrieb | Anwendung laeuft als root, Firewall bleibt unantastbar |
+| **M5** | `run.sh`, Healthcheck, `tests/leak-test.sh` | reproduzierbarer Betrieb, Dichtheit nachgewiesen |
+| **M6** | `tests/perf-baseline.sh`, Messtabelle | Durchsatz belegt statt behauptet |
+| **M7** | `README.md`, `.env.example`, `.gitignore` | uebergabefaehig |
 
 ---
 
-## 9. Konventionen fuer die Skripte
+## 12. Konventionen fuer die Skripte
 
-Alle Skripte (`run.sh`, `apply-rules.sh`, `container/*.sh`,
-`tests/leak-test.sh`) folgen deinen Skript-Konventionen:
+Alle Skripte folgen deinen Skript-Konventionen:
 
 * Header mit Name, Beschreibung/Zweck, Programmablaufplan (bei den laengeren
   Skripten), Usage-Hinweis, `Version: 1.0.0 (JJJJ-MM-TT)` nach SemVer.
   Kein Author-Feld.
 * `-h`/`--help` mit vollstaendiger Parameterliste inklusive der jeweils
   zugehoerigen Umgebungsvariable.
-* `-s`/`--silent` und `-v`/`--verbose` fuer `run.sh` und `apply-rules.sh`
-  (beide klar ueber 50 Zeilen). Silent gewinnt, wenn beides gesetzt ist.
+* `-s`/`--silent` und `-v`/`--verbose` fuer `run.sh` und `apply-rules.sh`.
+  Silent gewinnt, wenn beides gesetzt ist.
 * Jeder Parameter auch per exportierter Umgebungsvariable mit Praefix
-  `SANDBOX_` uebergebbar; Praezedenz: Standardwert < `.env` < Umgebung < CLI.
+  `SANDBOX_`; Praezedenz: Standardwert < `.env` < Umgebung < CLI.
 * Ausschliesslich ASCII, Kommentare und Ausgaben auf Englisch.
 * Variablen durchgaengig als `"${var}"`.
 * Aussagekraeftige Fehlermeldungen nach STDERR, kein pauschales Verwerfen von
   STDERR, Exit 2 bei Aufruffehlern.
 
 **Offener Punkt Logging:** Die Konventionen sehen `logger`/syslog im
-nicht-interaktiven Betrieb vor. Ich implementiere das bewusst nicht ungefragt.
+nicht-interaktiven Betrieb vor. Ich implementiere das nicht ungefragt.
 Vorschlag: zunaechst reine STDOUT/STDERR-Ausgabe, Logging als To-do markiert -
-sag mir, wie du es haben willst (syslog-Facility, Loglevel, Format).
+sag mir, wie du es haben willst (Facility, Loglevel, Format).
 
 ---
 
-## 10. Offene Punkte / Rueckfragen
+## 13. Offene Punkte
 
-1. **Variante A oder B?** Soll der `ssh -D`-Prozess im Container laufen
-   (Empfehlung) oder auf dem Host? Davon haengen `apply-rules.sh` und das
-   Key-Handling ab.
-2. **Authentifizierung:** Key-Datei read-only einbinden oder
-   `SSH_AUTH_SOCK`/Agent-Forwarding? Agent ist sicherer, macht `run.sh` aber
-   abhaengig von einer laufenden Agent-Session.
-3. **Zielanwendung:** Gibt es eine konkrete erste Anwendung? Davon haengt ab,
-   ob `APP_PACKAGES` reicht oder ein `app/install.sh`-Hook noetig ist - und ob
-   sie zwingend root braucht (dann direkt Ausbaustufe 2).
+1. **Binding des SSH-Tunnels** (Abschnitt 5.4): `0.0.0.0` plus Firewall
+   (Vorschlag), an die Bridge-IP, oder an ein Dummy-Interface?
+2. **Zielanwendung:** Welche ist es konkret? Davon haengt ab, ob
+   `APP_PACKAGES` reicht oder ein `app/install.sh`-Hook noetig ist - und ob
+   sie tatsaechlich `CAP_SYS_NICE` braucht.
+3. **Netz-Bedarf der Anwendung:** Wenig Netz-I/O (dann ist redsocks
+   irrelevant) oder datenintensiv (dann wird redsocks zum Flaschenhals und
+   wir sollten frueh messen)?
 4. **DNS-Upstream:** Welcher Resolver soll hinter dem Tunnel angesprochen
-   werden? Der Default `9.9.9.9` ist eine Setzung, keine Empfehlung.
-5. **Konfigurationsdatei-Schema:** Deine Konventionen sehen fuer Skripte die
+   werden? `9.9.9.9` ist eine Setzung, keine Empfehlung.
+5. **Persistenz der Host-Regeln:** Reicht der Aufruf durch `run.sh`, oder soll
+   eine systemd-Unit mitgeliefert werden?
+6. **Konfigurationsdatei-Schema:** Deine Konventionen sehen die
    organisationsbasierte Suche (`/etc/org.conf`, `/etc/${ORGANIZATION}/...`)
-   vor. Fuer ein Repo-lokales Projekt wirkt `.env` im Projektverzeichnis
-   passender. Soll `apply-rules.sh` das Org-Schema zusaetzlich unterstuetzen?
-6. **Persistenz der Host-Regeln:** Reicht der Aufruf durch `run.sh`, oder soll
-   eine systemd-Unit mitgeliefert werden, die die Regeln beim Boot setzt?
-7. **`internal: true`:** In Variante B waere ein Docker-Netz mit
-   `internal: true` naheliegend. Ob der Container dann noch das
-   Bridge-Gateway (und damit den SOCKS-Port auf dem Host) erreicht, muss im
-   PoC geprueft werden - die Compose-Spezifikation sagt dazu nur
-   "externally isolated network", nicht, wie der Host selbst behandelt wird.
+   vor. Fuer ein Repo-lokales Projekt wirkt `.env` passender. Soll
+   `apply-rules.sh` das Org-Schema zusaetzlich unterstuetzen?
+7. **Zielplattform des Hosts:** Ubuntu, Rocky oder beides? Bei "nur Ubuntu"
+   waere die Variante aus 5.5 ("alles auf dem Host") die schlankere Loesung,
+   weil der App-Container dann voellig unangetastet bleibt.
 
 ---
 
-## 11. Verifizierte Grundlagen
+## 14. Verifizierte Grundlagen
 
-Die folgenden Punkte wurden fuer diesen Plan gegen die Primaerquellen geprueft
-und nicht aus dem Gedaechtnis angenommen:
+Gegen Primaerquellen geprueft, nicht aus dem Gedaechtnis angenommen:
 
 * `ubuntu:26.04` existiert als offizieller Docker-Tag (identischer Digest wie
-  `resolute-*`), abgefragt ueber die Docker-Hub-API am 2026-09-18.
+  `resolute-*`), abgefragt ueber die Docker-Hub-API.
 * `redsocks` (universe), `unbound` (main), `autossh` (universe),
   `openssh-client` (main) und `iptables` sind in Ubuntu 26.04 "resolute"
   paketiert.
-* redsocks-Konfigurationsoptionen (`base`, `redsocks`, `dnstc`, `dnsu2t`) und
-  die empfohlenen iptables-Regeln stammen aus `redsocks.conf.example` und
-  `README.md` des Projekts.
-* `DOCKER-USER` wird vor `DOCKER-FORWARD`/`DOCKER` ausgewertet; an `FORWARD`
-  angehaengte Regeln laufen zu spaet (Docker-Dokumentation "Docker with
-  iptables").
-* `--dns=127.0.0.1` bezieht sich auf die Loopback-Adresse des Containers;
-  Docker betreibt bei benutzerdefinierten Netzen einen eingebetteten Resolver
-  auf `127.0.0.11` (Docker-Netzwerkdokumentation).
-* `-m owner` ist nur in `OUTPUT` und `POSTROUTING` gueltig
+* redsocks-Optionen inkl. `splice` ("Enable or disable faster data pump based
+  on splice(2) syscall. Default value depends on your kernel version, true for
+  2.6.27.13+") aus `redsocks.conf.example`; die Implementierung in
+  `redsocks.c` nutzt `splice()` mit `SPLICE_F_MOVE`.
+* `dnstc` beantwortet UDP-Anfragen mit gesetztem TC-Bit und erzwingt so den
+  TCP-Retry (redsocks-README).
+* `REDIRECT` ist "only valid in the nat table, in the PREROUTING and OUTPUT
+  chains" und setzt das Ziel auf "the primary address of the incoming
+  interface" (`iptables-extensions(8)`).
+* `-m owner` ist "only valid in the OUTPUT and POSTROUTING chains. Forwarded
+  packets do not have any socket associated with them."
   (`iptables-extensions(8)`).
-* `network_mode: "service:{name}"` und `internal: true` sind Bestandteil der
-  Compose-Spezifikation.
-* OpenSSH stellt mit `-D` einen SOCKS4/SOCKS5-Server bereit, der kein
-  `UDP ASSOCIATE` unterstuetzt - bestaetigt auf der Mailingliste
-  openssh-unix-dev.
+* `DOCKER-USER` wird vor `DOCKER-FORWARD`/`DOCKER` ausgewertet; an `FORWARD`
+  angehaengte Regeln laufen zu spaet (Docker-Dokumentation).
+* Dockers Default-Capability-Set enthaelt `NET_ADMIN`, `SYS_NICE`, `IPC_LOCK`
+  und `SYS_ADMIN` **nicht** (Docker-Quelltext `oci/caps/defaults.go`).
+* CFS-Bandwidth-Throttling: "Once all quota has been assigned any additional
+  requests for quota will result in those threads being throttled. Throttled
+  threads will not be able to run again until the next period when the quota
+  is replenished." (Kernel-Dokumentation `sched-bwc.rst`).
+* `com.docker.network.bridge.name` ("Interface name to use when creating the
+  Linux bridge") und `com.docker.network.bridge.enable_ip_masquerade` sind
+  dokumentierte Treiberoptionen.
+* `network_mode: "service:{name}"`, `cpuset`, `cpus`, `ulimits`, `shm_size`
+  und `init` sind Bestandteil der Compose-Spezifikation.
+* RFC 7766 macht TCP-Unterstuetzung fuer DNS verpflichtend und erlaubt
+  ausdruecklich, TCP ohne vorherigen UDP-Versuch zu verwenden; RFC 9210
+  (BCP 235) macht das Zulassen von DNS ueber TCP zur Best Current Practice.
+* Die glibc wiederholt eine Anfrage bei gesetztem TC-Bit ueber TCP; nur
+  `RES_IGNTC` schaltet das ab (`resolver(3)`).
 
-**Nicht abschliessend verifiziert** (Doku-Seite war aus dieser Umgebung nicht
-erreichbar, im PoC gegenzupruefen): die exakte Semantik von unbounds
-`tcp-upstream: yes`. Die Option ist laut NLnet-Labs-Dokumentation dafuer
-gedacht, Upstream-Anfragen ausschliesslich ueber TCP zu fuehren, was genau
-unserem Tunnel-Szenario entspricht; das gehoert in M2 als Erstes auf den
-Pruefstand.
+**Nicht abschliessend verifiziert** (Doku aus dieser Umgebung nicht
+erreichbar, im PoC gegenzupruefen):
+
+* die exakte Semantik von unbounds `tcp-upstream: yes` - laut
+  NLnet-Labs-Dokumentation fuehrt sie Upstream-Anfragen ausschliesslich ueber
+  TCP, was genau unserem Szenario entspricht. Erster Pruefpunkt in M2.
+* ob Compose `dns:` zusammen mit `network_mode: "service:..."` akzeptiert.
+  Der Bind-Mount von `/etc/resolv.conf` ist deshalb der Vorschlag.
+* ob `redsocks` auf Rocky Linux paketiert ist. Falls nein, ist das ein
+  weiteres Argument fuer die Sidecar-Variante statt "alles auf dem Host".
 
 ### Quellen
 
 - [Docker: Docker with iptables](https://docs.docker.com/engine/network/firewall-iptables/)
 - [Docker: Packet filtering and firewalls](https://docs.docker.com/engine/network/packet-filtering-firewalls/)
+- [Docker: Bridge network driver options](https://docs.docker.com/engine/network/drivers/bridge/)
 - [Docker: Networking overview (embedded DNS, --dns)](https://docs.docker.com/engine/network/)
+- [moby/moby: oci/caps/defaults.go](https://github.com/moby/moby/blob/master/oci/caps/defaults.go)
 - [Compose Specification](https://github.com/compose-spec/compose-spec/blob/main/spec.md)
 - [redsocks (darkk/redsocks)](https://github.com/darkk/redsocks)
 - [Unbound: unbound.conf(5)](https://unbound.docs.nlnetlabs.nl/en/latest/manpages/unbound.conf.html)
-- [iptables-extensions(8)](https://man7.org/linux/man-pages/man8/iptables-extensions.8.html)
+- [iptables-extensions(8)](https://manpages.ubuntu.com/manpages/noble/man8/iptables-extensions.8.html)
+- [Linux kernel: CFS Bandwidth Control](https://www.kernel.org/doc/html/latest/scheduler/sched-bwc.html)
+- [RFC 7766: DNS Transport over TCP - Implementation Requirements](https://www.rfc-editor.org/info/rfc7766/)
+- [RFC 9210: DNS Transport over TCP - Operational Requirements (BCP 235)](https://www.rfc-editor.org/info/rfc9210/)
+- [resolver(3)](https://manpages.ubuntu.com/manpages/noble/man3/resolver.3.html)
 - [openssh-unix-dev: SOCKS5 and UDP](https://openssh-unix-dev.mindrot.narkive.com/CtaC5QcY/socks5-and-udp)
 - [Docker Hub: ubuntu (official image)](https://hub.docker.com/_/ubuntu)
-- [Ubuntu Packages: redsocks](https://packages.ubuntu.com/resolute/redsocks)

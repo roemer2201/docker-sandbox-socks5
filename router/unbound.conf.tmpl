@@ -1,0 +1,38 @@
+# unbound configuration template for the sandbox router.
+#
+# Rendered at container start by entrypoint.sh via envsubst. Placeholders:
+#   ${SANDBOX_DNS_UPSTREAM}  IP address of the upstream resolver (must be an IP)
+#
+# All upstream queries are forced over TCP (tcp-upstream: yes). That TCP stream
+# is caught by the iptables REDIRECT and thus travels through the SOCKS5 tunnel,
+# which cannot carry UDP. unbound caches, which hides the added TCP/tunnel
+# latency for repeated lookups.
+
+server:
+    # Started as root, unbound binds port 53 and then drops to this account.
+    username: "unbound"
+    chroot: ""
+    directory: "/etc/unbound"
+    pidfile: "/run/unbound.pid"
+    use-syslog: no
+    logfile: ""
+    verbosity: 1
+
+    interface: 127.0.0.1
+    port: 53
+    do-ip4: yes
+    do-ip6: no
+    do-udp: yes
+    do-tcp: yes
+    access-control: 127.0.0.0/8 allow
+    access-control: 0.0.0.0/0 refuse
+    hide-identity: yes
+    hide-version: yes
+    qname-minimisation: yes
+    prefetch: yes
+    # Force every upstream query onto TCP so it rides the SOCKS5 tunnel.
+    tcp-upstream: yes
+
+forward-zone:
+    name: "."
+    forward-addr: ${SANDBOX_DNS_UPSTREAM}

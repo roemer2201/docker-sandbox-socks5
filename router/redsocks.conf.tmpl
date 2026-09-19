@@ -1,0 +1,29 @@
+// redsocks configuration template for the sandbox router.
+//
+// Rendered at container start by entrypoint.sh via envsubst. Placeholders:
+//   ${SANDBOX_REDSOCKS_PORT}  local port that iptables REDIRECT points to
+//   ${SANDBOX_SOCKS_PORT}     local port of the ssh -D SOCKS5 listener
+//
+// redsocks drops privileges to the "tunnel" account after start. Its outgoing
+// connection to the local ssh -D listener therefore carries the tunnel UID and
+// is exempted from the REDIRECT loop by the firewall.
+
+base {
+    log_debug  = off;
+    log_info   = on;
+    log        = "stderr";
+    daemon     = off;
+    user       = tunnel;
+    group      = tunnel;
+    redirector = iptables;
+}
+
+redsocks {
+    local_ip   = 127.0.0.1;
+    local_port = ${SANDBOX_REDSOCKS_PORT};
+
+    // Upstream is the local ssh -D SOCKS5 listener.
+    ip         = 127.0.0.1;
+    port       = ${SANDBOX_SOCKS_PORT};
+    type       = socks5;
+}

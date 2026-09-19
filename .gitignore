@@ -1,0 +1,8 @@
+# Local configuration and secrets never belong in the repository.
+.env
+secrets/*
+!secrets/.gitkeep
+
+# Rendered configs (generated inside the container at runtime).
+router/redsocks.conf
+router/unbound.conf

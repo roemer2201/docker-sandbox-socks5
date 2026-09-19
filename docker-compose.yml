@@ -1,0 +1,112 @@
+# Two-container network sandbox.
+#
+#   router : owns the network namespace and runs every network service
+#            (ssh -D tunnel, redsocks, unbound, firewall).
+#   app    : the untrusted workload; shares the router's network namespace and
+#            has no network control of its own.
+#
+# All values come from .env (see .env.example). Names use the SANDBOX_ prefix so
+# the same variables drive both compose and the helper scripts.
+
+name: ${SANDBOX_PROJECT_NAME:-docker-sandbox-socks5}
+
+services:
+  router:
+    build:
+      context: ./router
+      args:
+        BASE_IMAGE: ${SANDBOX_BASE_IMAGE:-ubuntu:26.04}
+        TUNNEL_UID: ${SANDBOX_TUNNEL_UID:-10002}
+    image: sandbox-router:local
+    container_name: ${SANDBOX_ROUTER_NAME:-sandbox-router}
+    hostname: router
+    # Only the capabilities the router genuinely needs: firewall management,
+    # binding port 53, and dropping privileges for unbound.
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - NET_BIND_SERVICE
+      - SETUID
+      - SETGID
+      - CHOWN
+      - DAC_OVERRIDE
+      - SETPCAP
+      - KILL
+    security_opt:
+      - no-new-privileges:true
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: "1"
+      net.ipv6.conf.default.disable_ipv6: "1"
+    environment:
+      SANDBOX_SSH_HOST: ${SANDBOX_SSH_HOST:-}
+      SANDBOX_SSH_PORT: ${SANDBOX_SSH_PORT:-22}
+      SANDBOX_SSH_USER: ${SANDBOX_SSH_USER:-}
+      SANDBOX_SOCKS_PORT: ${SANDBOX_SOCKS_PORT:-1080}
+      SANDBOX_REDSOCKS_PORT: ${SANDBOX_REDSOCKS_PORT:-12345}
+      SANDBOX_TUNNEL_UID: ${SANDBOX_TUNNEL_UID:-10002}
+      SANDBOX_SUBNET: ${SANDBOX_SUBNET:-172.28.77.0/24}
+      SANDBOX_DNS_UPSTREAM: ${SANDBOX_DNS_UPSTREAM:-9.9.9.9}
+      SANDBOX_TUNNEL_WAIT: ${SANDBOX_TUNNEL_WAIT:-30}
+    volumes:
+      - ${SANDBOX_SSH_KEY:-./secrets/id_ed25519}:/etc/sandbox/ssh/id_key:ro
+      - ${SANDBOX_SSH_KNOWN_HOSTS:-./secrets/known_hosts}:/etc/sandbox/ssh/known_hosts:ro
+    networks:
+      - egress
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/healthcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  app:
+    build:
+      context: ./app
+      args:
+        BASE_IMAGE: ${SANDBOX_BASE_IMAGE:-ubuntu:26.04}
+        APP_PACKAGES: ${SANDBOX_APP_PACKAGES:-}
+    image: sandbox-app:local
+    container_name: ${SANDBOX_APP_NAME:-sandbox-app}
+    # Share the router's network namespace. The router firewall applies here too.
+    # With this set, the app must not declare networks, ports, dns or hostname.
+    network_mode: "service:router"
+    depends_on:
+      router:
+        condition: service_healthy
+    # The workload may run as root but gets no capabilities and cannot gain any,
+    # so it cannot touch the firewall in the shared namespace.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # cap_add: [SYS_NICE]   # uncomment only if the workload sets scheduling
+                            # priority or CPU affinity and you accept the wider cap.
+    # Pin to specific CPUs instead of a CFS quota (which would throttle). Empty
+    # means all CPUs. See README section on CPU throughput.
+    cpuset: "${SANDBOX_APP_CPUSET:-}"
+    shm_size: "${SANDBOX_APP_SHM_SIZE:-256m}"
+    ulimits:
+      memlock: -1
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      SANDBOX_APP_CMD: ${SANDBOX_APP_CMD:-}
+    # DNS points at the router's local unbound; this bypasses Docker's embedded
+    # resolver, whose upstream lookups would otherwise leak past the tunnel.
+    volumes:
+      - ./router/resolv.conf:/etc/resolv.conf:ro
+    restart: unless-stopped
+
+networks:
+  egress:
+    driver: bridge
+    driver_opts:
+      # Fixed bridge name so the host firewall can match on the interface.
+      com.docker.network.bridge.name: ${SANDBOX_BRIDGE:-br-sandbox}
+    ipam:
+      config:
+        - subnet: ${SANDBOX_SUBNET:-172.28.77.0/24}

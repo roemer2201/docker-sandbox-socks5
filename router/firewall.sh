@@ -18,6 +18,7 @@
 #
 # Program flow:
 #   1. Read parameters from the environment and validate them.
+#   1b. Select the iptables backend (legacy/nft) matching Docker's rules.
 #   2. Flush any previous sandbox chains (idempotent re-apply).
 #   3. nat table: build SANDBOX_REDIR and hook it into OUTPUT.
 #   4. filter table: default-DROP policies plus the tunnel allowance.
@@ -33,8 +34,10 @@
 #     SANDBOX_SSH_HOST_IP    resolved IP of the ssh server (required)
 #     SANDBOX_SSH_PORT       ssh server port (default 22)
 #     SANDBOX_SUBNET         sandbox subnet in CIDR (default 172.28.77.0/24)
+#     SANDBOX_IPTABLES_BACKEND  auto|nft|legacy (default auto: match the
+#                            backend Docker already uses in this netns)
 #
-# Version: 1.0.0  (2026-09-19)
+# Version: 1.1.0  (2026-09-26)
 
 set -euo pipefail
 
@@ -52,6 +55,7 @@ Installs the sandbox router firewall. Parameters come from the environment:
   SANDBOX_SSH_HOST_IP    resolved IP of the ssh server    (required)
   SANDBOX_SSH_PORT       ssh server port                  (default 22)
   SANDBOX_SUBNET         sandbox subnet in CIDR           (default 172.28.77.0/24)
+  SANDBOX_IPTABLES_BACKEND  auto|nft|legacy               (default auto)
 USAGE
 }
 
@@ -75,6 +79,7 @@ SOCKS_PORT="${SANDBOX_SOCKS_PORT:-1080}"
 SSH_HOST_IP="${SANDBOX_SSH_HOST_IP:-}"
 SSH_PORT="${SANDBOX_SSH_PORT:-22}"
 SUBNET="${SANDBOX_SUBNET:-172.28.77.0/24}"
+BACKEND="${SANDBOX_IPTABLES_BACKEND:-auto}"
 
 [ -n "${SSH_HOST_IP}" ] || die "SANDBOX_SSH_HOST_IP is required (resolved ssh server IP)"
 
@@ -83,57 +88,90 @@ case "${SSH_HOST_IP}" in
     *[!0-9.]*) die "SANDBOX_SSH_HOST_IP is not an IPv4 address: ${SSH_HOST_IP}" ;;
 esac
 
+# --- Select the iptables backend -----------------------------------------
+# Docker installs the NAT rules for its embedded DNS (127.0.0.11) into this
+# netns using the backend the *host* daemon uses. Our rules must use the same
+# backend: mixing legacy and nft tables splits the ruleset across two engines,
+# and some kernels (e.g. OpenVZ/Virtuozzo) refuse to create the nft nat OUTPUT
+# base chain while a legacy nat table exists ("CHAIN_ADD failed (Device or
+# resource busy)"). "auto" picks legacy if legacy rules are already present.
+select_backend() {
+    case "${BACKEND}" in
+        nft|legacy) ;;
+        auto)
+            if iptables-legacy -t nat -S 2>/dev/null | grep -q '^-[AN] ' \
+               || iptables-legacy -S 2>/dev/null | grep -q '^-[AN] '; then
+                BACKEND=legacy
+            else
+                BACKEND=nft
+            fi
+            ;;
+        *) die "SANDBOX_IPTABLES_BACKEND must be auto, nft or legacy: ${BACKEND}" ;;
+    esac
+    IPT="iptables-${BACKEND}"
+    IP6T="ip6tables-${BACKEND}"
+    command -v "${IPT}" >/dev/null 2>&1 || die "${IPT} not found"
+}
+select_backend
+
 # --- nat table: transparent TCP redirection ------------------------------
 # Rebuild SANDBOX_REDIR from scratch so re-applying is idempotent.
-iptables -t nat -F SANDBOX_REDIR 2>/dev/null || true
-iptables -t nat -N SANDBOX_REDIR 2>/dev/null || true
+"${IPT}" -t nat -F SANDBOX_REDIR 2>/dev/null || true
+"${IPT}" -t nat -N SANDBOX_REDIR 2>/dev/null || true
 
 # Do not touch traffic created by the tunnel account (ssh + redsocks); this is
 # what prevents the redsocks -> REDIRECT -> redsocks loop.
-iptables -t nat -A SANDBOX_REDIR -m owner --uid-owner "${TUNNEL_UID}" -j RETURN
+"${IPT}" -t nat -A SANDBOX_REDIR -m owner --uid-owner "${TUNNEL_UID}" -j RETURN
 # Leave loopback and intra-subnet traffic alone.
-iptables -t nat -A SANDBOX_REDIR -d 127.0.0.0/8 -j RETURN
-iptables -t nat -A SANDBOX_REDIR -d "${SUBNET}" -j RETURN
+"${IPT}" -t nat -A SANDBOX_REDIR -d 127.0.0.0/8 -j RETURN
+"${IPT}" -t nat -A SANDBOX_REDIR -d "${SUBNET}" -j RETURN
 # Everything else that is TCP goes to redsocks.
-iptables -t nat -A SANDBOX_REDIR -p tcp -j REDIRECT --to-ports "${REDSOCKS_PORT}"
+"${IPT}" -t nat -A SANDBOX_REDIR -p tcp -j REDIRECT --to-ports "${REDSOCKS_PORT}"
 
 # Hook the chain into OUTPUT exactly once.
-iptables -t nat -C OUTPUT -p tcp -j SANDBOX_REDIR 2>/dev/null \
-    || iptables -t nat -A OUTPUT -p tcp -j SANDBOX_REDIR
+"${IPT}" -t nat -C OUTPUT -p tcp -j SANDBOX_REDIR 2>/dev/null \
+    || "${IPT}" -t nat -A OUTPUT -p tcp -j SANDBOX_REDIR
 
 # --- filter table: default deny, allow only the tunnel -------------------
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT DROP
+"${IPT}" -P INPUT DROP
+"${IPT}" -P FORWARD DROP
+"${IPT}" -P OUTPUT DROP
 
 # Flush the built-in chains so a re-apply does not stack duplicate rules.
-iptables -F INPUT
-iptables -F FORWARD
-iptables -F OUTPUT
+"${IPT}" -F INPUT
+"${IPT}" -F FORWARD
+"${IPT}" -F OUTPUT
 
 # Loopback is unrestricted. REDIRECTed packets leave via lo (destination becomes
 # 127.0.0.1), so this rule also covers the path into redsocks.
-iptables -A INPUT  -i lo -j ACCEPT
-iptables -A OUTPUT -o lo -j ACCEPT
+"${IPT}" -A INPUT  -i lo -j ACCEPT
+"${IPT}" -A OUTPUT -o lo -j ACCEPT
+
+# REDIRECTed connections: the -o lo rule above is not enough. On some kernels
+# (seen on OpenVZ/Virtuozzo) the filter OUTPUT chain still sees the original
+# egress interface for the first packet after the nat rewrite, so the SYN to
+# redsocks hits the DROP policy. Accept exactly that: NATed TCP to redsocks.
+"${IPT}" -A OUTPUT -p tcp -d 127.0.0.1 --dport "${REDSOCKS_PORT}" \
+    -m conntrack --ctstate DNAT -j ACCEPT
 
 # Keep established flows (return traffic of the tunnel and of loopback).
-iptables -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
-iptables -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+"${IPT}" -A INPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+"${IPT}" -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
 # The single permitted non-loopback egress: the ssh tunnel itself.
-iptables -A OUTPUT -p tcp -d "${SSH_HOST_IP}" --dport "${SSH_PORT}" \
+"${IPT}" -A OUTPUT -p tcp -d "${SSH_HOST_IP}" --dport "${SSH_PORT}" \
     -m owner --uid-owner "${TUNNEL_UID}" -j ACCEPT
 
 # --- IPv6: closed completely --------------------------------------------
 # IPv6 is a classic bypass. It is disabled via sysctl in compose; the DROP
 # policy here is the belt-and-suspenders second half.
-ip6tables -P INPUT DROP   2>/dev/null || true
-ip6tables -P FORWARD DROP 2>/dev/null || true
-ip6tables -P OUTPUT DROP  2>/dev/null || true
-ip6tables -F INPUT   2>/dev/null || true
-ip6tables -F OUTPUT  2>/dev/null || true
-ip6tables -A INPUT  -i lo -j ACCEPT 2>/dev/null || true
-ip6tables -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
+"${IP6T}" -P INPUT DROP   2>/dev/null || true
+"${IP6T}" -P FORWARD DROP 2>/dev/null || true
+"${IP6T}" -P OUTPUT DROP  2>/dev/null || true
+"${IP6T}" -F INPUT   2>/dev/null || true
+"${IP6T}" -F OUTPUT  2>/dev/null || true
+"${IP6T}" -A INPUT  -i lo -j ACCEPT 2>/dev/null || true
+"${IP6T}" -A OUTPUT -o lo -j ACCEPT 2>/dev/null || true
 
-printf 'sandbox firewall applied (tunnel uid=%s, ssh=%s:%s)\n' \
-    "${TUNNEL_UID}" "${SSH_HOST_IP}" "${SSH_PORT}"
+printf 'sandbox firewall applied (backend=%s, tunnel uid=%s, ssh=%s:%s)\n' \
+    "${BACKEND}" "${TUNNEL_UID}" "${SSH_HOST_IP}" "${SSH_PORT}"

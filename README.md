@@ -105,6 +105,7 @@ Alternativ kann das App-Image erweitert werden (eigenes Binary per `COPY` in
 | `SANDBOX_SOCKS_PORT` | lokaler SOCKS5-Port des Tunnels | `1080` |
 | `SANDBOX_REDSOCKS_PORT` | lokaler redsocks-Port | `12345` |
 | `SANDBOX_TUNNEL_UID` | UID von ssh/redsocks (darf nicht die der App sein) | `10002` |
+| `SANDBOX_IPTABLES_BACKEND` | iptables-Backend im Router: `auto`, `nft`, `legacy` | `auto` |
 | `SANDBOX_SSH_HOST` | SSH-Server (Host oder IP) | - |
 | `SANDBOX_SSH_PORT` | SSH-Port | `22` |
 | `SANDBOX_SSH_USER` | SSH-Benutzer | - |
@@ -187,6 +188,11 @@ Fuer maximalen Durchsatz gilt:
 * **Router wird nicht "healthy".** `./run.sh logs` ansehen. Haeufig: falscher
   `SANDBOX_SSH_HOST/USER`, leere/falsche `known_hosts`, `AllowTcpForwarding no`
   auf dem Server, oder `SANDBOX_DNS_UPSTREAM` ist ein Name statt einer IP.
+* **`CHAIN_ADD failed (Device or resource busy): chain OUTPUT`.** Docker legt
+  die NAT-Regeln seines eingebauten DNS mit dem Backend des Hosts
+  (legacy/nft) im Container-Namespace an. Der Router muss dasselbe Backend
+  verwenden; `SANDBOX_IPTABLES_BACKEND=auto` erkennt das. Nur bei Bedarf
+  explizit auf `legacy` oder `nft` setzen.
 * **DNS im Container geht nicht.** Pruefe, dass `/etc/resolv.conf` im
   App-Container `nameserver 127.0.0.1` enthaelt und der Router "healthy" ist.
 * **`getent`/`curl` fehlen im App-Container.** Das App-Image ist minimal; setze

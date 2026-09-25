@@ -49,6 +49,7 @@ services:
       SANDBOX_SUBNET: ${SANDBOX_SUBNET:-172.28.77.0/24}
       SANDBOX_DNS_UPSTREAM: ${SANDBOX_DNS_UPSTREAM:-9.9.9.9}
       SANDBOX_TUNNEL_WAIT: ${SANDBOX_TUNNEL_WAIT:-30}
+      SANDBOX_IPTABLES_BACKEND: ${SANDBOX_IPTABLES_BACKEND:-auto}
     volumes:
       - ${SANDBOX_SSH_KEY:-./secrets/id_ed25519}:/etc/sandbox/ssh/id_key:ro
       - ${SANDBOX_SSH_KNOWN_HOSTS:-./secrets/known_hosts}:/etc/sandbox/ssh/known_hosts:ro
